@@ -106,9 +106,11 @@ typedef struct { uint64_t total; uint64_t offset; uint64_t len; } GhosttyTermina
 - Test: `tests/test_cells.py`, `tests/test_native_getters.py`
 
 **Interfaces:**
-- Produces: `Cell(text, width, style_id, link_id)`; `CellStyle`; `InternerFull(Exception)`; `StyleInterner`/`LinkInterner` with `.generation`, `.intern(value) -> int` (**raises `InternerFull`**), `.resolve(id)`, `.table() -> tuple[...]`, `.rollover()`; `Native.get_bool/get_u16/get_u32/get_enum/get_struct`.
+- Produces: `Cell(text, width, style_id, link_id)`; `CellStyle`; `InternerFull(Exception)`; `StyleInterner` with `.generation`, `.limit`, `.set_limit(n)`, `.intern(style) -> int` (**raises `InternerFull`**), `.resolve(id)`, `.table()`, `.rollover()`; `LinkInterner` with the same shape except `.intern(uri) -> int | None` (**never raises — degrades**); `Native.get_bool/get_u16/get_u32/get_enum/get_struct`.
 
-`LinkInterner` lands here, not in Task 11: `Cell.link_id` exists from this task, so the type that assigns it must exist too. Task 11 adds only the *policy* around URIs.
+`LinkInterner` lands here, not in Task 12: `Cell.link_id` exists from this task, so the type that assigns it must exist too. Task 12 adds only the *policy* around URIs.
+
+**The two interners fail differently, on purpose.** A style is load-bearing — a cell with no resolvable style cannot be rendered — so style overflow raises and forces a rollover. A hyperlink is optional metadata; a terminal that refuses to draw because a page carries 2,000 distinct URIs would be absurd. Link overflow therefore stops interning and yields `link_id=None`, degrading the link rather than the frame. This also keeps links out of the termination argument in Task 4 entirely.
 
 - [ ] **Step 1: Write the failing interner tests**
 
@@ -176,6 +178,26 @@ def test_link_interner_bounds_uri_length():
     interner = LinkInterner(limit=8, max_uri_bytes=16)
     assert interner.intern("https://a.example") is None  # too long -> not interned
     assert interner.resolve(interner.intern("https://a.co")) == "https://a.co"
+
+
+def test_link_interner_degrades_instead_of_raising_on_overflow():
+    """Links are optional metadata; overflow must not break rendering."""
+    interner = LinkInterner(limit=2, max_uri_bytes=64)
+    assert interner.intern("https://a.co") == 0
+    assert interner.intern("https://b.co") == 1
+    assert interner.intern("https://c.co") is None      # degraded, not raised
+    assert len(interner.table()) == 2
+
+
+def test_style_limit_can_be_raised_for_a_larger_viewport():
+    """Terminal raises this on resize so a full frame always fits. See Task 4."""
+    interner = StyleInterner(limit=2)
+    interner.intern(RED)
+    interner.intern(BLUE)
+    with pytest.raises(InternerFull):
+        interner.intern(CellStyle(fg=(1, 1, 1)))
+    interner.set_limit(4)
+    assert interner.intern(CellStyle(fg=(1, 1, 1))) == 2
 
 
 def test_continuation_cell_has_zero_width():
@@ -256,6 +278,10 @@ class StyleInterner:
     def table(self) -> tuple[CellStyle, ...]:
         return tuple(self._reverse)
 
+    def set_limit(self, limit: int) -> None:
+        """Raise (or lower) the cap. `Terminal` keeps this at >= cols * rows."""
+        self.limit = limit
+
     def rollover(self) -> None:
         self._forward.clear()
         self._reverse.clear()
@@ -264,7 +290,11 @@ class StyleInterner:
 
 @dataclass(slots=True)
 class LinkInterner:
-    """Same shape, plus a URI length bound. Over-long URIs are dropped, not interned."""
+    """Same shape, but degrades instead of raising.
+
+    Over-long URIs and overflow both yield None, so the cell renders with
+    link_id=None and the frame is unaffected.
+    """
 
     limit: int = 1024
     max_uri_bytes: int = 2048
@@ -279,7 +309,7 @@ class LinkInterner:
         if existing is not None:
             return existing
         if len(self._reverse) >= self.limit:
-            raise InternerFull(f"link table is at its limit of {self.limit}")
+            return None  # degrade: an unlinked cell beats an unrenderable frame
         link_id = len(self._reverse)
         self._forward[uri] = link_id
         self._reverse.append(uri)
@@ -302,7 +332,7 @@ class LinkInterner:
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `uv run pytest tests/test_cells.py -v`
-Expected: 9 passed
+Expected: 11 passed
 
 - [ ] **Step 5: Add typed getters to `_native.py` with tests**
 
@@ -546,7 +576,7 @@ Three things to get right:
 
 1. `read_rows` clears **per-row** dirty via `row_set(iterator, ROW_OPTION_DIRTY, &false)`. A separate `clear_global_dirty()` calls `render_state_set(state, OPTION_DIRTY, &false)`. Both are required.
 2. `read_cursor()` checks `CURSOR_VIEWPORT_HAS_VALUE` **before** reading X/Y, and returns `visible=False` without reading them when it is false.
-3. `InternerFull` from `styles.intern` or `links.intern` propagates — Task 4's `snapshot()` handles it. Do not catch it here.
+3. `InternerFull` from `styles.intern` propagates — Task 4's `snapshot()` handles it. Do not catch it here. `links.intern` **never raises**: it returns `None` on an over-long URI or a full table, and the cell is built with `link_id=None`.
 
 Use `ghostty_cell_get_multi` for the common key set once the single-key version is green and tested; keep the single-key path as the differential reference.
 
@@ -594,6 +624,8 @@ git commit -m "feat: render state extraction via the public cell accessor ABI"
 - Produces: `Terminal(cols, rows, *, scrollback=5000, theme=None, clipboard=ClipboardPolicy(), limits=ResourceLimits())`; `.feed(bytes) -> TerminalEffects`; `.close()`; `.closed`; context manager. `TerminalEffects(pty_writes, notifications)`. `ClipboardPolicy(allow_write=False, max_bytes=1_000_000)`. `ResourceLimits(max_interned_styles=4096, max_interned_links=1024, max_link_uri_bytes=2048, kitty_image_storage_bytes=0, apc_max_bytes=8192, apc_max_bytes_kitty=8192, notification_rate_per_sec=60)`. Notifications `TitleChanged`, `BellRang`, `ClipboardWritten`.
 
 `ResourceLimits` carries the APC fields **now** so Task 12 can derive terminal options from it without changing the type.
+
+**`max_interned_styles` bounds historical accumulation, not the current viewport.** The style table retains styles that have scrolled out of view, and that is what needs a cap over a long session. It is *not* a cap on how many distinct styles one frame may contain — a 120×40 viewport can legitimately need 4,800, above the 4096 default. `Terminal` therefore applies an **effective limit of `max(configured, cols * rows)`**, recomputed on construction and on every resize (Task 4). Document this on the field; a reader who assumes the configured number caps a single frame will misconfigure it.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -785,20 +817,58 @@ def test_resize_produces_a_frame_without_a_feed():
 
 
 def test_style_overflow_rolls_over_within_one_snapshot():
-    """The rollover must complete in the snapshot that overflows, not the next one."""
-    limits = ResourceLimits(max_interned_styles=4)
-    with Terminal(20, 3, limits=limits) as terminal:
-        terminal.feed(b"hi")
+    """The rollover must complete in the snapshot that overflows, not the next one.
+
+    A 2x1 viewport with limit 2 is the smallest case where the table can fill
+    with *historical* styles while the live frame still needs only two. Any
+    larger limit would be raised to cols*rows and could never overflow here.
+    """
+    limits = ResourceLimits(max_interned_styles=2)
+    with Terminal(2, 1, limits=limits) as terminal:
+        # Fill the table across snapshots: A and B become historical.
+        terminal.feed(b"\x1b[38;2;10;0;0mA")
+        terminal.snapshot()
+        terminal.feed(b"\x1b[38;2;20;0;0mB")
         first = terminal.snapshot()
-        for value in range(20):
-            terminal.feed(f"\x1b[38;2;{value};0;0mx".encode())
+        assert len(first.styles) == 2
+
+        # A third style overflows. The live frame still needs at most two.
+        terminal.feed(b"\x1b[1;1H\x1b[38;2;30;0;0mC")
         second = terminal.snapshot()
+
         assert second.generation > first.generation
         assert second.full_redraw
-        assert len(second.styles) <= 4
+        assert len(second.styles) <= 2
         for patch in second.row_patches:
             for cell in patch.cells:
                 assert 0 <= cell.style_id < len(second.styles)
+
+
+def test_effective_style_limit_covers_the_viewport():
+    """120x40 needs 4800 distinct styles worst case; the default is 4096."""
+    with Terminal(120, 40) as terminal:
+        assert terminal.effective_style_limit >= 120 * 40
+
+
+def test_resize_raises_the_effective_style_limit():
+    """Validating only at construction would break the invariant on growth."""
+    with Terminal(20, 3) as terminal:
+        terminal.resize(200, 60)
+        assert terminal.effective_style_limit >= 200 * 60
+
+
+def test_a_full_frame_of_unique_styles_does_not_fail():
+    """The worst case the termination argument depends on."""
+    with Terminal(20, 3, limits=ResourceLimits(max_interned_styles=2)) as terminal:
+        payload = b"".join(
+            b"\x1b[38;2;%d;%d;0m%c" % (i % 256, i // 256, 97 + (i % 26)) for i in range(60)
+        )
+        terminal.feed(b"\x1b[1;1H" + payload)
+        frame = terminal.snapshot(force=True)
+        assert frame is not None
+        for patch in frame.row_patches:
+            for cell in patch.cells:
+                assert 0 <= cell.style_id < len(frame.styles)
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -818,10 +888,15 @@ def snapshot(self, *, force: bool = False) -> Frame | None:
         try:
             patches = self._render.read_rows(self._styles, self._links, force=force)
         except InternerFull:
-            # The table filled mid-extraction. Discard the partial result, roll
-            # over both tables, and restart as a forced full extraction. The
-            # second attempt cannot overflow: a full frame interns at most
-            # cols*rows distinct styles, and the limit is validated above that.
+            # The style table filled mid-extraction. Discard the partial result,
+            # roll over, and restart as a forced full extraction.
+            #
+            # Termination: a full extraction visits cols*rows cells and so
+            # interns at most cols*rows distinct styles. The effective limit is
+            # max(configured, cols*rows), kept current by _apply_style_limit()
+            # on construction and resize, so the second attempt cannot overflow.
+            # Only StyleInterner raises -- LinkInterner degrades to None, so
+            # links play no part in this argument.
             self._styles.rollover()
             self._links.rollover()
             self._render.update(self._terminal)
@@ -845,14 +920,33 @@ def snapshot(self, *, force: bool = False) -> Frame | None:
     )
 ```
 
-Validate at construction that `max_interned_styles >= cols * rows` is achievable, or clamp and document; otherwise the restart guarantee does not hold.
+**Do not validate or reject** `max_interned_styles < cols * rows`. Raise it:
 
-Document on the method: dirty state is cleared before returning, so a caller that raises while applying a frame must recover with `snapshot(force=True)`.
+```python
+def _apply_style_limit(self) -> None:
+    """Keep the style cap at or above one full frame.
+
+    The configured limit bounds historical accumulation over a long session; it
+    is not a statement about how many styles one viewport may need. A 120x40
+    frame can need 4800, above the 4096 default, so the effective cap is the
+    larger of the two. Call from __init__ and resize().
+    """
+    self._styles.set_limit(max(self._limits.max_interned_styles, self._cols * self._rows))
+
+@property
+def effective_style_limit(self) -> int:
+    return self._styles.limit
+```
+
+`resize()` must call it, not just `__init__` — growing the viewport past the
+construction size would otherwise break the termination guarantee.
+
+Document on `snapshot()`: dirty state is cleared before returning, so a caller that raises while applying a frame must recover with `snapshot(force=True)`.
 
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `uv run pytest tests/test_emulator_frames.py -v`
-Expected: 7 passed
+Expected: 10 passed
 
 - [ ] **Step 5: Lint and commit**
 
@@ -1604,6 +1698,30 @@ def test_oversized_link_uris_are_not_interned():
         assert terminal.snapshot(force=True).row_patches[0].cells[0].link_id is None
 
 
+def test_more_visible_links_than_the_limit_degrades_gracefully():
+    """A frame may legitimately contain more unique URIs than the cap.
+
+    Link overflow must not raise, must not roll the frame over, and must not
+    produce an unresolvable link_id -- the excess cells simply carry None.
+    """
+    limits = ResourceLimits(max_interned_links=4)
+    with Terminal(40, 2, limits=limits) as terminal:
+        payload = b"".join(
+            b"\x1b]8;;https://example.com/%d\x1b\\L\x1b]8;;\x1b\\" % i for i in range(20)
+        )
+        terminal.feed(payload)
+        frame = terminal.snapshot(force=True)
+        assert frame is not None
+        assert len(frame.links) <= 4
+        linked = 0
+        for patch in frame.row_patches:
+            for cell in patch.cells:
+                if cell.link_id is not None:
+                    assert 0 <= cell.link_id < len(frame.links)
+                    linked += 1
+        assert linked > 0, "the first few links should still resolve"
+
+
 def test_clipboard_write_is_off_by_default():
     with Terminal(80, 24) as terminal:
         assert terminal.feed(b"\x1b]52;c;aGk=\x07").notifications == ()
@@ -1638,7 +1756,7 @@ def test_kitty_image_storage_is_disabled():
 
 - [ ] **Step 3: Implement** — link resolution via the grid-reference/hyperlink ABI; `LinkClicked` carries the URI and the library **never opens it**; scheme policy belongs to the application.
 
-- [ ] **Step 4: Run to verify they pass** — Expected: 7 passed
+- [ ] **Step 4: Run to verify they pass** — Expected: 8 passed
 
 - [ ] **Step 5: Extend `REQUIRED_SYMBOLS`/`test_abi.py`** with the hyperlink/grid-ref symbols.
 
@@ -1850,3 +1968,19 @@ Then write the `pysshmanager` cutover plan (spec §8 and §13), including the ~1
 | Packaging test too weak | Accepted — builds a wheel, installs into a clean venv, checks exports, `py.typed`, licence (Task 13) |
 | Scheduled job re-syncs the pin | Accepted — `uv run --no-sync` |
 | `macos-13` is retired | Accepted — current labels, with an instruction to confirm against the runner-images table at write time |
+
+### Second-round corrections — the interner termination invariant
+
+The `max_interned_styles >= cols * rows` guard added in the first revision was
+wrong in four ways, all verified.
+
+| Finding | Disposition |
+|---|---|
+| Default 4096 < 120×40 = 4800 | Accepted. Not a validation error — the effective limit is `max(configured, cols * rows)` |
+| Rollover test used limit 4 on 20×3 (= 60), so clamping made overflow impossible | Accepted. Rewritten as 2×1 with limit 2, filling the table with *historical* styles so the live frame still needs only two and the forced restart provably terminates |
+| Resizing past the construction size broke the invariant | Accepted. `_apply_style_limit()` is called from `resize()`, not only `__init__`; test added |
+| Link overflow used the same restart path, but a frame may hold more than `max_interned_links` unique URIs, so "the second extraction cannot overflow" was false | Accepted. `LinkInterner` no longer raises — it returns `None` and the cell renders unlinked. Links are optional metadata; degrading a link beats failing a frame. This removes links from the termination argument entirely |
+
+Semantics now documented on the field: `max_interned_styles` bounds **historical
+accumulation across a session**, not the number of styles one viewport may
+contain.

@@ -49,6 +49,8 @@ All measured against `pyghostty==0.1.0`, macOS arm64, unless noted.
 | `GhosttySizeReportSize` fields | `rows`, `columns`, `cell_width`, `cell_height` — **no pixel fields**; pixel size is derived |
 | `ghostty_terminal_resize(..., 0, 0)` | **Succeeds**; `WIDTH_PX`/`HEIGHT_PX` become `0` |
 | `ghostty_terminal_reset()` clears | title, scrollback (36→0), total rows (41→5), alternate-screen state |
+| `ghostty_terminal_reset()` **preserves** | OSC 10/11 default-colour overrides — `0x0000ff` before and after |
+| Colour accessors on a fresh terminal | return `rc=-4`; readable only once an override exists |
 | Encoders present | `ghostty_key_encoder_*` incl. `setopt_from_terminal`, `ghostty_focus_encode`, `ghostty_paste_is_safe`, `ghostty_paste_encode` |
 | Resource-limit options present | `KITTY_IMAGE_STORAGE_LIMIT`, `APC_MAX_BYTES`, `APC_MAX_BYTES_KITTY` |
 | Wheel tags | `manylinux_2_27_aarch64.manylinux_2_28_aarch64`, `manylinux_2_27_x86_64.manylinux_2_28_x86_64`, `macosx_13_0_arm64`, `macosx_13_0_x86_64` |
@@ -92,9 +94,10 @@ does for `GhosttyPointS`, and verify on all four target platforms. Upstream it t
 
 - Bundled Ghostty commit `88b4cd0` — could not confirm from the shipped
   `.dylib`. Inconsequential, but record whatever the loader can actually read.
-- Whether `reset()` clears OSC palette / default-colour overrides and selection.
-  My probe's colour accessor was reading the wrong type, so the result was
-  meaningless and is excluded. **Day-one test.**
+- Whether `reset()` clears a *selection*. Setting one requires the selection API
+  rather than VT input, and the question is moot given the `hard_reset()`
+  decision in §3.5 — recreation clears everything. Asserted anyway in
+  `test_reset.py` for documentation value.
 - The review's benchmark figures (38.6 ms per-cell vs 4.1 ms render-state at
   120×40). Not reproduced. They support this design rather than challenge it, so
   they are treated as motivation, not evidence — §11 requires our own numbers.
@@ -305,13 +308,26 @@ migration must not silently transpose them; §8 makes the adapter explicit.
   thread/event loop; callers marshal bytes arriving from elsewhere. A DEBUG-only
   owner-thread assertion enforces it.
 
-**`hard_reset()`.** Measured, `ghostty_terminal_reset()` clears title,
-scrollback, total rows, and alternate-screen state — which is most of what
-reconnect needs. Two unknowns remain (OSC palette overrides, selection). If the
-day-one test shows either survives, `hard_reset()` is implemented by freeing and
-recreating the terminal, render state, iterators, encoders, and callbacks with
-the retained configuration. The public contract is "a completely clean terminal"
-either way; the implementation is chosen by that test.
+**`hard_reset()` frees and recreates. This is decided, not conditional.**
+
+`ghostty_terminal_reset()` clears title, scrollback, total rows, and
+alternate-screen state — but **measurement shows it preserves OSC 10/11
+default-colour overrides**: after `\x1b]10;#ff0000\x07`, `COLOR_FOREGROUND` reads
+`0x0000ff` both before and after the reset.
+
+That is disqualifying for reconnect. A remote `.bashrc` that repaints the
+terminal would leave its colours bleeding into the next session, and colour
+overrides are precisely the kind of state a user attributes to the *client*
+rather than the dead connection.
+
+`hard_reset()` therefore frees and recreates the terminal, render state,
+iterators, encoders, and callbacks, carrying the retained configuration
+(`scrollback`, `theme`, `clipboard`, `limits`) forward. The cost is one
+allocation per reconnect, which is nothing against spawning an SSH process.
+
+`ghostty_terminal_reset()` is still the right call for a guest-initiated RIS
+(`ESC c`), where preserving embedder colour configuration is correct behaviour.
+The two are different operations and the spec keeps them distinct.
 
 ### 3.6 Errors are fatal and visible
 

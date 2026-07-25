@@ -53,6 +53,8 @@ All measured against `pyghostty==0.1.0`, macOS arm64, unless noted.
 | Colour accessors on a fresh terminal | return `rc=-4`; readable only once an override exists |
 | Encoders present | `ghostty_key_encoder_*` incl. `setopt_from_terminal`, `ghostty_focus_encode`, `ghostty_paste_is_safe`, `ghostty_paste_encode` |
 | Resource-limit options present | `KITTY_IMAGE_STORAGE_LIMIT`, `APC_MAX_BYTES`, `APC_MAX_BYTES_KITTY` |
+| Cell and row representation | `GhosttyCell` and `GhosttyRow` are opaque `uint64_t` handles; cell data is read through `ghostty_cell_get`/`ghostty_cell_get_multi` |
+| Public cell metadata | `GhosttyCellWide` supplies `NARROW`, `WIDE`, `SPACER_HEAD`, and `SPACER_TAIL`; `HAS_STYLING`, `STYLE_ID`, and `HAS_HYPERLINK` cover the remaining render decisions |
 | Wheel tags | `manylinux_2_27_aarch64.manylinux_2_28_aarch64`, `manylinux_2_27_x86_64.manylinux_2_28_x86_64`, `macosx_13_0_arm64`, `macosx_13_0_x86_64` |
 
 ### v1 errors corrected
@@ -128,7 +130,7 @@ class Terminal:
     def encode_key(self, event: KeyEvent) -> bytes | None: ...
     def encode_mouse(self, event: MouseEvent) -> bytes | None: ...
     def encode_focus(self, focused: bool) -> bytes | None: ...
-    def encode_paste(self, text: str) -> bytes: ...
+    def encode_paste(self, text: str) -> bytes | None: ...
 
     modes: TerminalModes
     title: str | None
@@ -155,6 +157,8 @@ class Frame:
     rows: int
     full_redraw: bool
     row_patches: tuple[RowPatch, ...]
+    styles: tuple[CellStyle, ...]   # index == style_id; complete generation table
+    links: tuple[str, ...]          # index == link_id; complete generation table
     cursor: CursorState
     viewport: ViewportState
     frame_pending: bool
@@ -174,6 +178,12 @@ Python copies. No public object holds a grid reference past the next mutation.
 Because `snapshot()` clears dirty state before returning, a Python exception
 while the widget applies a frame loses it — recovery is `snapshot(force=True)`,
 and this is documented on the method.
+
+**Frames are self-contained.** Every frame carries the complete style and link
+tables for its generation, not ids that require a later lookup against mutable
+terminal state. The widget applies the frame, both tables, and the shadow-buffer
+patches as one assignment. A generation rollover therefore cannot expose a
+shadow buffer whose ids resolve against the wrong tables.
 
 **Synchronized output (DECSET 2026) is not reimplemented.** First measure how
 Ghostty's own dirty flags behave inside a synchronized frame, including an
@@ -222,12 +232,29 @@ class ClipboardPolicy:
 
 @dataclass(frozen=True, slots=True)
 class ResourceLimits:
+    # Bounds historical accumulation. The effective per-terminal limit is
+    # max(this value, cols * rows), recomputed on construction and resize.
     max_interned_styles: int = 4096
     max_interned_links: int = 1024
     max_link_uri_bytes: int = 2048
     kitty_image_storage_bytes: int = 0  # graphics parsed but not stored
+    apc_max_bytes: int = 8192
+    apc_max_bytes_kitty: int = 8192
     notification_rate_per_sec: int = 60
 ```
+
+`max_interned_styles` limits styles retained after their cells have left the
+viewport; it does not cap the fidelity of one visible frame. A full extraction
+can visit `cols * rows` cells and therefore require that many distinct styles.
+The effective limit is `max(configured, cols * rows)`, applied at construction
+and after every resize. This is the termination invariant for rollover: after a
+style overflow, a forced full extraction is guaranteed to fit.
+
+Links deliberately have different overflow semantics. An over-long URI or a
+full link table yields `link_id=None`; it never raises and never fails a frame.
+Links are optional metadata, so rendering unlinked content is safer than making
+terminal output unavailable. APC limits are passed to Ghostty alongside the
+zero kitty-image storage limit.
 
 Configurable identity is added when a consumer needs to change it.
 
@@ -375,7 +402,16 @@ theme change still forces `snapshot(force=True)` and rebuilds the Rich style map
 
 **Interning is bounded** (`ResourceLimits`). A hostile remote can emit unbounded
 true-colour combinations or OSC 8 URIs; a process-lifetime dictionary would be a
-memory sink. On overflow the cache is generation-cycled, not grown.
+memory sink. Style insertion raises `InternerFull` *before* exceeding the
+effective limit. `snapshot()` catches it, discards the partial extraction,
+cycles the generation, and restarts with a forced full frame. The effective
+style limit is always at least `cols * rows`, so the second extraction cannot
+overflow.
+
+Link insertion never raises. It returns `None` when the URI is too long or the
+link table is full, and the cell is rendered without a link. A style is
+load-bearing render data; a hyperlink is optional metadata, so the two
+interners intentionally do not share failure policy.
 
 **Rollover is not a quiet eviction.** Every `style_id` and `link_id` already
 sitting in the shadow buffer refers to the *current* generation's tables. Cycling
@@ -383,9 +419,10 @@ those tables invalidates them all, and a partially-updated shadow buffer would
 render with ids that no longer resolve. Rollover is therefore an atomic,
 all-or-nothing operation:
 
-1. increment the intern generation;
-2. force `snapshot(force=True)` — a complete frame, not a patch set;
-3. swap the shadow buffer *and* both lookup tables together, so no render can
+1. increment the intern generation and clear both tables;
+2. restart extraction with `snapshot(force=True)` — a complete frame, not a
+   patch set;
+3. swap the shadow buffer *and* both frame-owned lookup tables together, so no render can
    observe a shadow buffer and a table from different generations.
 
 `Frame.generation` carries the intern generation, and the widget asserts it
@@ -395,6 +432,13 @@ a dropped frame (§3.1) safe.
 
 Also specified: spacer head/tail cells, combining graphemes, tabs, invalid
 UTF-8, and over-wide graphemes each get a defined mapping into the fixed grid.
+
+**Never decode a private cell bit layout.** `GhosttyCell` and `GhosttyRow` are
+opaque `uint64_t` handles. Rendering uses the public row/cell iterators plus
+`ghostty_cell_get`/`ghostty_cell_get_multi`, including `GhosttyCellWide` for
+continuations. A private fast path is considered only after a measured public-
+path budget miss and must be guarded by differential tests against the public
+accessors.
 
 ## 5. `theme.py`
 
@@ -426,7 +470,8 @@ class TerminalView(Widget):
     ) -> None: ...
 
     def feed(self, data: bytes) -> None
-    def hard_reset(self) -> None
+    def hard_reset(self) -> None          # terminal and shadow state only
+    async def reset_io(self) -> None      # writer/session boundary
     def sync_terminal_size(self) -> tuple[int, int]
 
     class Resized(Message): cols: int; rows: int
@@ -568,28 +613,37 @@ never look like a pane that has stopped receiving output.
 
 ### 6.10 Reset and reconnect discard pending writes
 
-`hard_reset()` is not only a terminal operation — it is a session boundary.
+Terminal reset and transport reset are separate operations. `hard_reset()`
+recreates the emulator and clears the shadow buffer synchronously, but it cannot
+cancel an in-flight `await send(...)`. `reset_io()` is the asynchronous session
+boundary.
+
 Bytes still queued from the previous session (a keystroke, a DSR reply generated
 just before the disconnect) must never reach the reconnected process, where they
 would be interpreted by a different shell.
 
-`hard_reset()` therefore:
+`reset_io()` therefore:
 
-- drains and **discards** the writer queue without sending;
-- increments a **writer generation**, so any in-flight `send` from the previous
-  generation is abandoned rather than awaited;
-- clears the failed state, resets the shadow buffer, and forces
-  `snapshot(force=True)`.
+- increments the writer generation;
+- cancels and **awaits** the writer task, so an in-flight send cannot race the
+  next transport;
+- drains and discards the old queue without sending;
+- creates a fresh queue/writer and clears the failed state.
+
+`hard_reset()` then recreates the terminal, resets the shadow buffer, and forces
+`snapshot(force=True)`. `on_unmount` also awaits `reset_io()` before releasing
+the widget.
 
 Ordering for `pysshmanager` reconnect is fixed in §8: close process →
-`view.hard_reset()` → start new process.
+`await view.reset_io()` → `view.hard_reset()` → start new process.
 
 ### 6.11 Link and clipboard security
 
 OSC content is untrusted remote input.
 
 - `LinkClicked` reports a URI and nothing else. **The library never opens it.**
-- URI length and interned-link count are bounded (`ResourceLimits`).
+- URI length and interned-link count are bounded (`ResourceLimits`); excess
+  links degrade to plain, unlinked cells rather than failing rendering.
 - Scheme policy belongs to the application, not the renderer.
 - OSC 52 clipboard write is **off by default**, size-bounded, text only.
 - Bell, title, and clipboard notifications are rate-limited against UI floods.
@@ -631,7 +685,8 @@ dependencies = [
 5. `TerminalEffects.pty_writes` route through the same ordered path as keys and
    paste, i.e. `SshSession.send`.
 6. `reconnect()` no longer resets a screen it does not own. Order becomes:
-   close process → `view.hard_reset()` → start new process. The wrapper drives it.
+   close process → `await view.reset_io()` → `view.hard_reset()` → start new
+   process. The wrapper drives it.
 7. The output callback is detached before unmount; a final PTY chunk racing pane
    removal is dropped, explicitly.
 8. `_APP_KEYS` moves into `reserved_keys`; `Ctrl+]` and app bindings stay in the
@@ -769,7 +824,8 @@ set from our own first measurement.
 - [ ] Deterministic ownership for every native object and callback
 - [ ] Binding/ABI failures fatal and visible
 - [ ] A fatal emulator error never escapes `TerminalView.feed()` into `SshSession._pump`
-- [ ] `hard_reset()` discards the previous session's queued writes
+- [ ] `reset_io()` cancels the writer and discards the previous session's queued writes
+- [ ] `hard_reset()` recreates terminal and shadow state after I/O reset
 - [ ] Intern rollover forces a full frame; no shadow buffer renders stale ids
 - [ ] Exact `pyghostty` version and ABI verified at startup
 - [ ] Initial PTY size applied synchronously before SSH starts
@@ -821,7 +877,19 @@ number.
 | C1 queue overflow is fail-fast, not backpressure | Accepted (§6.2) — sync `feed()` uses `put_nowait()` → `TerminalFailed`; async handlers may `await` |
 | C2 size/colour queries need their own callbacks | Accepted (§3.2, §3.4). **Measured**: this document's first draft was wrong — zero pixel dims do not make XTWINOPS reply; `OPT_SIZE` must be registered. Verified the remedy works |
 | C3 intern-generation rollover invalidates shadow ids | Accepted (§4) — generation bump + forced full frame + atomic table/shadow swap, guarded by `Frame.generation` |
-| C4 failure/reconnect output lifecycle | Accepted (§6.9, §6.10) — widget catches `GhosttyError` so it cannot reach `SshSession._pump` and recreate the ADR-0001 freeze; `hard_reset()` discards queued writes and bumps the writer generation |
+| C4 failure/reconnect output lifecycle | Accepted (§6.9, §6.10) — widget catches `GhosttyError` so it cannot reach `SshSession._pump` and recreate the ADR-0001 freeze; async `reset_io()` cancels and awaits the writer before terminal reset |
+
+### Implementation-plan reconciliation
+
+| Item | Disposition |
+|---|---|
+| Public cell ABI replaces private decoding | Verified — `GhosttyCell`/`GhosttyRow` are opaque `uint64_t`; rendering uses public accessors and `GhosttyCellWide` (§4) |
+| Style rollover and frame lookup tables were one contract | Accepted — insertion raises before overflow; snapshot restarts forced; frames carry complete generation-scoped style/link tables (§3.1, §4) |
+| Style limit must fit a full viewport | Accepted — effective limit is `max(configured, cols * rows)` on construction and resize; configured value bounds historical accumulation (§3.2, §4) |
+| Link overflow cannot participate in rollover | Accepted — over-limit links return `None` and render as unlinked cells (§4, §6.11) |
+| FFI output types and dirty lifecycle | Accepted — native calls use typed getters; cursor coordinates are gated by `HAS_VALUE`; global and row dirty flags are cleared independently (§3.1, §7) |
+| Synchronous widget reset cannot cancel a send | Accepted — terminal-only `hard_reset()` is separate from awaited `reset_io()` (§6.10) |
+| Resource limits omitted APC fields | Accepted — both APC limits are explicit policy and passed at construction (§3.2, §6.11) |
 
 ## Sources
 

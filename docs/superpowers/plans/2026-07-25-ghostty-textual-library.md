@@ -4,96 +4,126 @@
 
 **Goal:** Build a reusable Textual terminal widget over `libghostty-vt` that never owns a process, so applications that already manage their own PTY lifecycle can embed a modern terminal.
 
-**Architecture:** Two layers with one native boundary. The private `_native.py`/`_render.py` modules are the only code that touches C; `emulator.py` exposes a headless `Terminal` (bytes in, effects out, frames on demand); `widget.py` renders frames into Textual strips and encodes input. `libghostty-vt`'s C API is explicitly unstable, so all churn is confined below `emulator.py`.
+**Architecture:** Two layers with one native boundary. The private `_native.py`/`_render.py` modules are the only code that touches C; `emulator.py` exposes a headless `Terminal` (bytes in, effects out, self-contained frames on demand); `widget.py` renders frames into Textual strips and encodes input. `libghostty-vt`'s C API is explicitly unstable, so all churn is confined below `emulator.py`.
 
 **Tech Stack:** Python 3.12+, Textual 8.2.8, `pyghostty==0.1.0` (CFFI ABI mode over a bundled `libghostty-vt` shared library), pytest, ruff, hatchling.
 
-**Spec:** [`docs/superpowers/specs/2026-07-25-ghostty-textual-design-v2.md`](../specs/2026-07-25-ghostty-textual-design-v2.md)
+**Spec:** [`../specs/2026-07-25-ghostty-textual-design-v2.md`](../specs/2026-07-25-ghostty-textual-design-v2.md)
+
+**Revision:** v2 of this plan. v1 was reviewed and its Task 2 rested on a false premise — see [Review disposition](#review-disposition).
 
 ## Scope
 
-This plan covers spec §12 steps **3–7**: the library, from frame extraction through security policy. Steps 1–2 (native boundary, effects) are **already implemented and committed** — `src/ghostty_textual/_native.py` plus `tests/test_abi.py`, `test_effects.py`, `test_reset.py`, `test_resize.py`, 31 tests passing.
+Spec §12 steps **3–7**: the library, from frame extraction through security policy. Steps 1–2 are **already committed** — `_native.py` plus `test_abi.py`, `test_effects.py`, `test_reset.py`, `test_resize.py`, 31 tests passing.
 
-Step 8, the `pysshmanager` cutover, is deliberately **excluded**. It lives in a different repository, and the library must be independently green before anything migrates onto it. It gets its own plan once Task 12 lands.
+Step 8, the `pysshmanager` cutover, is **excluded**. Different repository; the library must be independently green first. It gets its own plan after Task 13.
 
 ## Global Constraints
 
-- Python `>=3.12`. Textual `>=8.2.8,<9`. `pyghostty==0.1.0` — pinned exactly, never widened without CI proof, because we bind its **private** `_ffi`/`_cdef` modules.
+- Python `>=3.12`. Textual `>=8.2.8,<9`. `pyghostty==0.1.0` — pinned exactly, because we bind its **private** `_ffi`/`_cdef` modules.
 - **The library never spawns a process, opens a PTY, or owns a transport.** Bytes in, bytes out.
 - `emulator.py`, `cells.py`, `theme.py`, `keys.py` must not import `textual`. `widget.py` must not import `pyghostty` or `cffi`.
+- **Use the public C accessors.** Never decode a `GhosttyCell`/`GhosttyRow` bit layout. They are opaque `uint64_t` handles with `ghostty_cell_get`/`ghostty_row_get`; a private fast path may only be added if a measured budget miss justifies it, and then it must be optional and differential-tested against the public path.
 - `libghostty-vt` is **not thread-safe**. Every `Terminal` operation happens on the owning thread/event loop.
-- Errors from the binding are **fatal and typed** (`GhosttyError`), never logged-and-swallowed. Malformed *remote* bytes are not errors — libghostty handles them.
+- Binding errors are **fatal and typed** (`GhosttyError`). Malformed *remote* bytes are not errors — libghostty handles them.
 - No `__del__` for correctness. Explicit `close()` and context managers only.
 - CFFI callback objects are held on the owning Python object until after the C object is freed.
-- All public dataclasses are `frozen=True, slots=True`. No public object may hold a C grid reference past the next terminal mutation.
+- All public dataclasses are `frozen=True, slots=True`. **Frames are self-contained** — no public object holds a C reference or an out-of-band table.
+- **Every task that introduces a new native call appends to `REQUIRED_SYMBOLS` in `_native.py` and extends `tests/test_abi.py` in the same commit.**
 - Line length 100. `ruff check src tests` must pass. Every task ends green.
 
-## Verified C API (use these exact names)
+## Verified C API
 
+All confirmed against the installed `pyghostty==0.1.0` wheel.
+
+**Cells and rows are opaque handles, not packed integers:**
+
+```c
+typedef uint64_t GhosttyCell;
+typedef uint64_t GhosttyRow;
+GhosttyResult ghostty_cell_get(GhosttyCell, GhosttyCellData, void *out);
+GhosttyResult ghostty_cell_get_multi(GhosttyCell, size_t, const GhosttyCellData*, void**, size_t*);
 ```
-ghostty_render_state_new(allocator, GhosttyRenderState* out)      -> GhosttyResult
-ghostty_render_state_update(state, terminal)                      -> GhosttyResult
-ghostty_render_state_begin_update(state, terminal)                -> GhosttyResult
-ghostty_render_state_end_update(state)                            -> GhosttyResult
-ghostty_render_state_get(state, GhosttyRenderStateData, void* out)-> GhosttyResult
-ghostty_render_state_colors_get(state, GhosttyRenderStateColors*) -> GhosttyResult
-ghostty_render_state_row_iterator_new(allocator, out_iterator)    -> GhosttyResult
-ghostty_render_state_row_iterator_next(iterator)                  -> bool
+
+`GhosttyCellData`: `CODEPOINT`, `WIDE`, `HAS_TEXT`, `HAS_STYLING`, `STYLE_ID`, `HAS_HYPERLINK`, `CONTENT_TAG`, `COLOR_RGB`, `COLOR_PALETTE`, `PROTECTED`, `SEMANTIC_CONTENT`.
+
+`GhosttyCellWide`: `NARROW`, `WIDE`, `SPACER_TAIL`, `SPACER_HEAD` — this is the width model; do not infer width from text.
+
+`GhosttyCellContentTag`: `CODEPOINT`, `CODEPOINT_GRAPHEME`, `BG_COLOR_PALETTE`, `BG_COLOR_RGB`.
+
+**Render state:**
+
+```c
+ghostty_render_state_new/free/update/begin_update/end_update
+ghostty_render_state_get(state, GhosttyRenderStateData, void* out)
+ghostty_render_state_set(state, GhosttyRenderStateOption, const void*)   // OPTION_DIRTY
+ghostty_render_state_colors_get(state, GhosttyRenderStateColors*)
+ghostty_render_state_row_iterator_new/next/free
 ghostty_render_state_row_get(iterator, GhosttyRenderStateRowData, void* out)
 ghostty_render_state_row_set(iterator, GhosttyRenderStateRowOption, const void*)
-ghostty_render_state_row_cells_new(allocator, out_cells)          -> GhosttyResult
-ghostty_render_state_row_cells_next(cells)                        -> bool
-ghostty_render_state_row_cells_get(cells, GhosttyRenderStateRowCellsData, void* out)
+ghostty_render_state_row_cells_new/next/select/get/free
 ```
 
-An iterator is **bound to a state** by `ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, iterator)`. A cells iterator is bound to a row by `ghostty_render_state_row_get(iterator, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, cells)`.
+Binding: `render_state_get(state, DATA_ROW_ITERATOR, iterator)` binds an iterator to a state; `render_state_row_get(iterator, ROW_DATA_CELLS, cells)` binds a cells iterator to a row; `render_state_row_cells_get(cells, ROW_CELLS_DATA_RAW, GhosttyCell*)` yields the cell handle.
 
-Enum values confirmed at runtime: `ROW_DATA_INVALID=0`, `ROW_DATA_DIRTY=1`, `ROW_DATA_RAW=2`, `ROW_DATA_CELLS=3`, `ROW_DATA_SELECTION=4`.
+Row data enum values: `INVALID=0`, `DIRTY=1`, `RAW=2`, `CELLS=3`, `SELECTION=4`.
 
-Cell data keys: `RAW`, `STYLE`, `GRAPHEMES_LEN`, `GRAPHEMES_BUF`, `GRAPHEMES_UTF8`, `BG_COLOR`, `FG_COLOR`, `SELECTED`, `HAS_STYLING`.
+**Clearing dirty state takes two calls.** Per-row: `render_state_row_set(iterator, ROW_OPTION_DIRTY, &false)`. Global: `render_state_set(state, OPTION_DIRTY, &false)`. Clearing one does not clear the other.
 
-Cursor comes from **viewport** fields: `CURSOR_VIEWPORT_X`, `CURSOR_VIEWPORT_Y`, `CURSOR_VIEWPORT_HAS_VALUE`, `CURSOR_VIEWPORT_WIDE_TAIL`, `CURSOR_VISIBLE`, `CURSOR_VISUAL_STYLE`, `CURSOR_BLINKING`.
+**Cursor** comes from viewport fields: `CURSOR_VIEWPORT_X/Y/HAS_VALUE/WIDE_TAIL`, `CURSOR_VISIBLE`, `CURSOR_VISUAL_STYLE`, `CURSOR_BLINKING`. Coordinates are **undefined unless `CURSOR_VIEWPORT_HAS_VALUE`**. `GhosttyTerminalCursorStyle`: `BAR`, `BLOCK`, `UNDERLINE`, `BLOCK_HOLLOW`.
+
+**Scrollbar** — the source of viewport offset:
+
+```c
+typedef struct { uint64_t total; uint64_t offset; uint64_t len; } GhosttyTerminalScrollbar;
+```
+
+**Output types are enum-sized or struct-typed, not `bool*`/`uint16_t*` by default.** Task 1 introduces typed helpers; never allocate an out-pointer ad hoc.
+
+**Measured** (macOS arm64, released wheel): public-accessor full-frame extraction at 120×40 is ≈4 ms, against a 10 ms budget. The public path is fast enough; there is no reason to touch private layout.
 
 ## File Structure
 
-| File | Responsibility | Imports C? |
+| File | Responsibility | Touches C? |
 |---|---|---|
-| `_native.py` | Loader, ABI verification, union twins | yes (**done**) |
-| `_render.py` | Render state → `RowPatch`/`CursorState`; dirty acknowledgement | yes |
-| `cells.py` | `Cell`, `CellStyle`, bounded generation-scoped interning | no |
+| `_native.py` | Loader, ABI verification, union twins, **typed getters** | yes (partly done) |
+| `_render.py` | Render state → `RowPatch`/`CursorState`/`ViewportState`; dirty acknowledgement | yes |
+| `cells.py` | `Cell`, `CellStyle`, `StyleInterner`, `LinkInterner`, `InternerFull` | no |
 | `theme.py` | `TerminalTheme`, palette → Ghostty colour options | no |
-| `emulator.py` | `Terminal`: lifecycle, `feed`, `snapshot`, viewport, encoders | yes |
+| `emulator.py` | `Terminal`: lifecycle, `feed`, `snapshot`, viewport, modes, encoders | yes |
 | `keys.py` | Textual `events.Key` → `KeyEvent` | no |
 | `widget.py` | `TerminalView`: shadow buffer, strips, input, selection | no |
 
-`_render.py` joining the native boundary is a **deliberate refinement** of spec §1, which named only `emulator.py`. The one-boundary principle is preserved — the boundary is the private `_`-prefixed modules — but render-state iteration is a big enough job to deserve its own file rather than doubling `emulator.py`'s size.
+`_render.py` joining the native boundary is a deliberate refinement of spec §1. The one-boundary principle holds — the boundary is the private `_`-prefixed modules — but render-state iteration deserves its own file.
 
 ---
 
-### Task 1: Cell model and bounded interning
+### Task 1: Cell model, interners, and typed native getters
 
 **Files:**
 - Create: `src/ghostty_textual/cells.py`
-- Test: `tests/test_cells.py`
+- Modify: `src/ghostty_textual/_native.py`
+- Test: `tests/test_cells.py`, `tests/test_native_getters.py`
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: `Cell(text: str, width: Literal[0,1,2], style_id: int, link_id: int | None)`; `CellStyle` (frozen); `StyleInterner` with `.generation: int`, `.intern(style: CellStyle) -> int`, `.resolve(style_id: int) -> CellStyle`, `.rollover_pending: bool`.
+- Produces: `Cell(text, width, style_id, link_id)`; `CellStyle`; `InternerFull(Exception)`; `StyleInterner`/`LinkInterner` with `.generation`, `.intern(value) -> int` (**raises `InternerFull`**), `.resolve(id)`, `.table() -> tuple[...]`, `.rollover()`; `Native.get_bool/get_u16/get_u32/get_enum/get_struct`.
 
-- [ ] **Step 1: Write the failing tests**
+`LinkInterner` lands here, not in Task 11: `Cell.link_id` exists from this task, so the type that assigns it must exist too. Task 11 adds only the *policy* around URIs.
+
+- [ ] **Step 1: Write the failing interner tests**
 
 ```python
 # tests/test_cells.py
 import pytest
-from ghostty_textual.cells import Cell, CellStyle, StyleInterner
+from ghostty_textual.cells import Cell, CellStyle, InternerFull, LinkInterner, StyleInterner
 
-RED = CellStyle(fg=(255, 0, 0), bg=(0, 0, 0))
-BLUE = CellStyle(fg=(0, 0, 255), bg=(0, 0, 0))
+RED = CellStyle(fg=(255, 0, 0))
+BLUE = CellStyle(fg=(0, 0, 255))
 
 
 def test_identical_styles_intern_to_the_same_id():
     interner = StyleInterner(limit=16)
-    assert interner.intern(RED) == interner.intern(CellStyle(fg=(255, 0, 0), bg=(0, 0, 0)))
+    assert interner.intern(RED) == interner.intern(CellStyle(fg=(255, 0, 0)))
 
 
 def test_different_styles_get_different_ids():
@@ -101,38 +131,58 @@ def test_different_styles_get_different_ids():
     assert interner.intern(RED) != interner.intern(BLUE)
 
 
-def test_resolve_returns_the_original_style():
+def test_resolve_returns_the_original():
     interner = StyleInterner(limit=16)
     assert interner.resolve(interner.intern(RED)) == RED
 
 
-def test_exceeding_the_limit_flags_a_rollover():
-    """A hostile remote can emit unbounded true-colour combinations."""
+def test_resolve_rejects_negative_ids():
+    """Python would happily return the last entry for -1."""
+    interner = StyleInterner(limit=16)
+    interner.intern(RED)
+    with pytest.raises(KeyError):
+        interner.resolve(-1)
+
+
+def test_intern_raises_before_exceeding_the_limit():
+    """A hard signal, not a flag: the table must never actually grow past limit."""
     interner = StyleInterner(limit=4)
     for value in range(4):
-        interner.intern(CellStyle(fg=(value, 0, 0), bg=None))
-    assert not interner.rollover_pending
-    interner.intern(CellStyle(fg=(99, 0, 0), bg=None))
-    assert interner.rollover_pending
+        interner.intern(CellStyle(fg=(value, 0, 0)))
+    with pytest.raises(InternerFull):
+        interner.intern(CellStyle(fg=(99, 0, 0)))
+    assert len(interner.table()) == 4
 
 
-def test_rollover_increments_generation_and_empties_the_table():
+def test_rollover_bumps_generation_and_empties_the_table():
     interner = StyleInterner(limit=4)
-    first_generation = interner.generation
-    for value in range(5):
-        interner.intern(CellStyle(fg=(value, 0, 0), bg=None))
+    start = interner.generation
+    interner.intern(RED)
     interner.rollover()
-    assert interner.generation == first_generation + 1
-    assert not interner.rollover_pending
+    assert interner.generation == start + 1
+    assert interner.table() == ()
     with pytest.raises(KeyError):
         interner.resolve(0)
 
 
+def test_table_is_ordered_by_id():
+    interner = StyleInterner(limit=16)
+    red_id, blue_id = interner.intern(RED), interner.intern(BLUE)
+    table = interner.table()
+    assert table[red_id] == RED and table[blue_id] == BLUE
+
+
+def test_link_interner_bounds_uri_length():
+    interner = LinkInterner(limit=8, max_uri_bytes=16)
+    assert interner.intern("https://a.example") is None  # too long -> not interned
+    assert interner.resolve(interner.intern("https://a.co")) == "https://a.co"
+
+
 def test_continuation_cell_has_zero_width():
-    assert Cell(text="", width=0, style_id=0, link_id=None).width == 0
+    assert Cell(text="", width=0, style_id=0).width == 0
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run to verify they fail**
 
 Run: `uv run pytest tests/test_cells.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'ghostty_textual.cells'`
@@ -140,13 +190,17 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ghostty_textual.cells'
 - [ ] **Step 3: Implement `cells.py`**
 
 ```python
-"""Cell model and bounded style interning. No C, no Textual."""
+"""Cell model and bounded interning. No C, no Textual."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Literal
 
 Rgb = tuple[int, int, int]
+
+
+class InternerFull(Exception):
+    """The table is at its limit. The caller must roll over and restart the frame."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,31 +216,24 @@ class CellStyle:
     invisible: bool = False
     strikethrough: bool = False
     overline: bool = False
-    underline: int = 0  # 0 = none
-
-
-@dataclass(frozen=True, slots=True)
-class Cell:
-    text: str
-    width: Literal[0, 1, 2]  # 0 = continuation of a wide grapheme
-    style_id: int
-    link_id: int | None = None
+    underline: int = 0
 
 
 DEFAULT_STYLE = CellStyle()
 
 
+@dataclass(frozen=True, slots=True)
+class Cell:
+    text: str
+    width: Literal[0, 1, 2]  # 0 = SPACER_TAIL/HEAD continuation
+    style_id: int
+    link_id: int | None = None
+
+
 @dataclass(slots=True)
 class StyleInterner:
-    """Maps styles to small ints, bounded so a hostile remote cannot exhaust memory.
-
-    Resolved RGB values are part of the key, so an OSC palette change naturally
-    produces new ids rather than needing separate invalidation.
-    """
-
     limit: int = 4096
     generation: int = 0
-    rollover_pending: bool = False
     _forward: dict[CellStyle, int] = field(default_factory=dict)
     _reverse: list[CellStyle] = field(default_factory=list)
 
@@ -195,370 +242,344 @@ class StyleInterner:
         if existing is not None:
             return existing
         if len(self._reverse) >= self.limit:
-            self.rollover_pending = True
+            raise InternerFull(f"style table is at its limit of {self.limit}")
         style_id = len(self._reverse)
         self._forward[style] = style_id
         self._reverse.append(style)
         return style_id
 
     def resolve(self, style_id: int) -> CellStyle:
-        try:
-            return self._reverse[style_id]
-        except IndexError as exc:
-            raise KeyError(style_id) from exc
+        if style_id < 0 or style_id >= len(self._reverse):
+            raise KeyError(style_id)
+        return self._reverse[style_id]
+
+    def table(self) -> tuple[CellStyle, ...]:
+        return tuple(self._reverse)
 
     def rollover(self) -> None:
-        """Discard the table and bump the generation.
-
-        Every style_id already in a shadow buffer is invalidated by this, so the
-        caller MUST force a full frame and swap the shadow buffer and tables
-        together. See spec v2 §4.
-        """
         self._forward.clear()
         self._reverse.clear()
         self.generation += 1
-        self.rollover_pending = False
+
+
+@dataclass(slots=True)
+class LinkInterner:
+    """Same shape, plus a URI length bound. Over-long URIs are dropped, not interned."""
+
+    limit: int = 1024
+    max_uri_bytes: int = 2048
+    generation: int = 0
+    _forward: dict[str, int] = field(default_factory=dict)
+    _reverse: list[str] = field(default_factory=list)
+
+    def intern(self, uri: str) -> int | None:
+        if len(uri.encode("utf-8")) > self.max_uri_bytes:
+            return None
+        existing = self._forward.get(uri)
+        if existing is not None:
+            return existing
+        if len(self._reverse) >= self.limit:
+            raise InternerFull(f"link table is at its limit of {self.limit}")
+        link_id = len(self._reverse)
+        self._forward[uri] = link_id
+        self._reverse.append(uri)
+        return link_id
+
+    def resolve(self, link_id: int) -> str:
+        if link_id < 0 or link_id >= len(self._reverse):
+            raise KeyError(link_id)
+        return self._reverse[link_id]
+
+    def table(self) -> tuple[str, ...]:
+        return tuple(self._reverse)
+
+    def rollover(self) -> None:
+        self._forward.clear()
+        self._reverse.clear()
+        self.generation += 1
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run to verify they pass**
 
 Run: `uv run pytest tests/test_cells.py -v`
-Expected: 6 passed
+Expected: 9 passed
 
-- [ ] **Step 5: Lint and commit**
+- [ ] **Step 5: Add typed getters to `_native.py` with tests**
+
+Ad-hoc `ffi.new("bool*")` is how you silently misread an enum-sized output. Centralise it:
+
+```python
+# in Native
+def get_bool(self, getter, handle, key, what) -> bool:
+    out = self.ffi.new("bool*")
+    self.check(getter(handle, key, out), what)
+    return bool(out[0])
+
+def get_enum(self, getter, handle, key, what) -> int:
+    """Enum outputs are int-sized, NOT bool/uint16. Reading them narrow is UB."""
+    out = self.ffi.new("int*")
+    self.check(getter(handle, key, out), what)
+    return int(out[0])
+
+def get_u16(self, getter, handle, key, what) -> int: ...
+def get_u32(self, getter, handle, key, what) -> int: ...
+def get_struct(self, getter, handle, key, ctype, what): ...
+```
+
+```python
+# tests/test_native_getters.py
+def test_enum_output_is_read_int_sized(native):
+    """GHOSTTY_RENDER_STATE_DATA_DIRTY and CURSOR_VISUAL_STYLE are enums."""
+    from tests.conftest import make_terminal
+    from ghostty_textual._render import RenderState
+
+    harness = make_terminal(native, cols=10, rows=2)
+    state = RenderState(native)
+    try:
+        harness.feed(b"hi")
+        state.update(harness.terminal)
+        assert isinstance(state.is_dirty(), bool)
+    finally:
+        state.close()
+        harness.close()
+```
+
+(That test depends on Task 2; mark it `xfail(strict=False)` here and unmark in Task 2 Step 6.)
+
+- [ ] **Step 6: Lint and commit**
 
 ```bash
 uv run ruff check src tests
-git add src/ghostty_textual/cells.py tests/test_cells.py
-git commit -m "feat: cell model with bounded generation-scoped style interning"
+git add src/ghostty_textual/cells.py src/ghostty_textual/_native.py tests/test_cells.py tests/test_native_getters.py
+git commit -m "feat: cell model, bounded interners with hard overflow, typed native getters"
 ```
 
 ---
 
-### Task 2: Render state wrapper
+### Task 2: Render state via the public cell ABI
 
 **Files:**
 - Create: `src/ghostty_textual/_render.py`
+- Modify: `src/ghostty_textual/_native.py` (`REQUIRED_SYMBOLS`), `tests/test_abi.py`
 - Test: `tests/test_render.py`
 
 **Interfaces:**
-- Consumes: `Native` and `GhosttyError` from `_native`; `Cell`, `CellStyle`, `StyleInterner` from `cells`.
-- Produces: `RowPatch(y: int, cells: tuple[Cell, ...])`; `CursorState(x: int, y: int, visible: bool, style: int, blinking: bool, wide_tail: bool)`; `RenderState` with `.update(terminal) -> None`, `.is_dirty() -> bool`, `.read_rows(interner, *, force: bool) -> tuple[RowPatch, ...]`, `.read_cursor() -> CursorState`, `.close() -> None`.
+- Consumes: `Native` typed getters; `Cell`, `CellStyle`, `StyleInterner`, `LinkInterner`, `InternerFull`.
+- Produces: `RowPatch(y, cells)`; `CursorState(x, y, visible, style, blinking, wide_tail)`; `ViewportState(at_bottom, offset, scrollback_rows, total_rows)`; `RenderState` with `.update(terminal)`, `.is_dirty()`, `.read_rows(styles, links, *, force) -> tuple[RowPatch, ...]`, `.read_cursor()`, `.clear_global_dirty()`, `.close()`.
+
+`ViewportState` is defined **here**, not in Task 5, because `Frame` (Task 4) references it before Task 5 runs.
+
+> **v1 of this plan was wrong here.** It described cells as packed `uint32` values and scheduled a reverse-engineering spike. `GhosttyCell` is an opaque `uint64_t` with public accessors covering every question that spike would have asked. There is no spike. Use `ghostty_cell_get`.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_render.py
 from ghostty_textual._render import RenderState
-from ghostty_textual.cells import StyleInterner
+from ghostty_textual.cells import LinkInterner, StyleInterner
 from tests.conftest import make_terminal
 
 
+def _read(state, harness, *, force=True):
+    state.update(harness.terminal)
+    return state.read_rows(StyleInterner(), LinkInterner(), force=force)
+
+
 def test_reading_rows_returns_the_fed_text(native):
-    harness = make_terminal(native, cols=20, rows=3)
-    state = RenderState(native)
+    harness, state = make_terminal(native, cols=20, rows=3), None
     try:
+        state = RenderState(native)
         harness.feed(b"hello")
-        state.update(harness.terminal)
-        rows = state.read_rows(StyleInterner(), force=True)
-        assert "".join(cell.text for cell in rows[0].cells).rstrip() == "hello"
+        rows = _read(state, harness)
+        assert "".join(c.text for c in rows[0].cells).rstrip() == "hello"
     finally:
-        state.close()
+        state and state.close()
+        harness.close()
+
+
+def test_wide_character_produces_a_spacer_tail(native):
+    """Width comes from GhosttyCellWide, never inferred from the text."""
+    harness, state = make_terminal(native, cols=10, rows=1), None
+    try:
+        state = RenderState(native)
+        harness.feed("界b".encode())
+        cells = _read(state, harness)[0].cells
+        assert (cells[0].text, cells[0].width) == ("界", 2)
+        assert cells[1].width == 0
+        assert cells[2].text == "b"
+    finally:
+        state and state.close()
         harness.close()
 
 
 def test_only_dirty_rows_are_returned(native):
-    harness = make_terminal(native, cols=20, rows=5)
-    state = RenderState(native)
-    interner = StyleInterner()
+    harness, state = make_terminal(native, cols=20, rows=5), None
+    styles, links = StyleInterner(), LinkInterner()
     try:
+        state = RenderState(native)
         harness.feed(b"one\r\ntwo\r\nthree")
         state.update(harness.terminal)
-        state.read_rows(interner, force=True)  # commits and clears dirty flags
+        state.read_rows(styles, links, force=True)
+        state.clear_global_dirty()
 
-        harness.feed(b"\x1b[1;1Hx")  # touch row 0 only
+        harness.feed(b"\x1b[1;1Hx")
         state.update(harness.terminal)
-        patched = state.read_rows(interner, force=False)
-        assert [patch.y for patch in patched] == [0]
+        assert [p.y for p in state.read_rows(styles, links, force=False)] == [0]
     finally:
-        state.close()
+        state and state.close()
         harness.close()
 
 
-def test_clean_state_reports_no_dirty_rows(native):
-    harness = make_terminal(native, cols=10, rows=2)
-    state = RenderState(native)
-    interner = StyleInterner()
+def test_clean_state_reports_nothing(native):
+    harness, state = make_terminal(native, cols=10, rows=2), None
+    styles, links = StyleInterner(), LinkInterner()
     try:
+        state = RenderState(native)
         harness.feed(b"hi")
         state.update(harness.terminal)
-        state.read_rows(interner, force=True)
+        state.read_rows(styles, links, force=True)
+        state.clear_global_dirty()
         state.update(harness.terminal)
-        assert state.read_rows(interner, force=False) == ()
+        assert state.read_rows(styles, links, force=False) == ()
     finally:
-        state.close()
+        state and state.close()
         harness.close()
 
 
-def test_cursor_comes_from_viewport_coordinates(native):
-    harness = make_terminal(native, cols=20, rows=3)
-    state = RenderState(native)
+def test_cursor_uses_viewport_coordinates(native):
+    harness, state = make_terminal(native, cols=20, rows=3), None
     try:
+        state = RenderState(native)
         harness.feed(b"abc")
         state.update(harness.terminal)
         cursor = state.read_cursor()
-        assert (cursor.x, cursor.y) == (3, 0)
-        assert cursor.visible
+        assert (cursor.x, cursor.y, cursor.visible) == (3, 0, True)
     finally:
-        state.close()
+        state and state.close()
         harness.close()
 
 
-def test_styles_are_interned_not_duplicated(native):
-    harness = make_terminal(native, cols=20, rows=1)
-    state = RenderState(native)
-    interner = StyleInterner()
+def test_cursor_coordinates_are_not_read_when_absent(native):
+    """CURSOR_VIEWPORT_X/Y are undefined unless HAS_VALUE; must report invisible."""
+    harness, state = make_terminal(native, cols=20, rows=3, scrollback=500), None
     try:
+        state = RenderState(native)
+        harness.feed(b"".join(b"l%d\r\n" % i for i in range(60)))
+        native.scroll_viewport(harness.terminal, native.lib.GHOSTTY_SCROLL_VIEWPORT_TOP)
+        state.update(harness.terminal)
+        assert not state.read_cursor().visible
+    finally:
+        state and state.close()
+        harness.close()
+
+
+def test_identical_styles_share_one_id(native):
+    harness, state = make_terminal(native, cols=20, rows=1), None
+    styles = StyleInterner()
+    try:
+        state = RenderState(native)
         harness.feed(b"\x1b[31maaa\x1b[0m")
         state.update(harness.terminal)
-        rows = state.read_rows(interner, force=True)
-        red_ids = {cell.style_id for cell in rows[0].cells[:3]}
-        assert len(red_ids) == 1
+        cells = state.read_rows(styles, LinkInterner(), force=True)[0].cells
+        assert len({c.style_id for c in cells[:3]}) == 1
     finally:
-        state.close()
+        state and state.close()
         harness.close()
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run to verify they fail**
 
 Run: `uv run pytest tests/test_render.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'ghostty_textual._render'`
 
-- [ ] **Step 3: Spike the cell encoding (30 minutes, throwaway script)**
+- [ ] **Step 3: Implement `_render.py` against the public accessors**
 
-The cell payload is a packed `uint32` and its layout is not in the header. Do not
-guess it — determine it, then write the decoder. Already established:
-
-| Fact | Evidence |
-|---|---|
-| Codepoint is `raw >> 2` | `0x184 >> 2 == 0x61 == 'a'`, `0x188 >> 2 == 0x62 == 'b'` |
-| Styled cells set a high bit | `'a'` red → `0x4000184`; unstyled `'c'` → `0x18c` |
-| `GRAPHEMES_UTF8` returns `rc=-3` for single-codepoint cells | only populated for multi-codepoint graphemes |
-| `HAS_STYLING` is a cheap early-out | `True` only for the SGR-styled cells |
-| **Row-level `ROW_DATA_RAW` returns a pointer** | `rc=0`, a bulk `uint32_t*` array for the whole row |
-
-Write a scratch script that feeds known input and prints `raw` in binary for each
-cell, and answer exactly these:
-
-1. What do the low 2 bits mean? (Candidates: cell width 0/1/2, or a content tag.)
-2. Which bit is "has style", and is there a style **index** in the high bits?
-3. How is a wide-character continuation cell encoded — zero `raw`, or a width tag?
-4. Does the row-level `RAW` pointer give `cols` entries of the same `uint32`? If
-   so, **use it**: one FFI call per row instead of one per cell, with per-cell
-   `row_cells_get` only for cells where `HAS_STYLING` or the grapheme bit is set.
-
-Suggested input: `b"a\x1b[31mb\x1b[0m"` + `"界".encode()` + `b"\xcc\x81"` (combining acute),
-in a 10x1 terminal, printing `f"{raw:032b}"` per cell.
-
-Record the answers as a comment block at the top of `_render.py`. This is the
-only reverse-engineered contract in the library; make it legible for the next
-person, and pin it with the tests in this task so a libghostty upgrade that
-changes the packing fails loudly.
-
-- [ ] **Step 4: Implement `_render.py`**
-
-Key points the implementer must get right:
-- Allocate the row iterator and cells iterator **once** and reuse them; binding is `render_state_get(state, DATA_ROW_ITERATOR, iterator)` and `render_state_row_get(iterator, ROW_DATA_CELLS, cells)`.
-- After committing a frame, clear **both** the per-row dirty flag (`row_set(iterator, ROW_OPTION_DIRTY, false)`) and re-check the global `DATA_DIRTY`. Clearing one does not clear the other.
-- Grapheme text comes from `ROW_CELLS_DATA_GRAPHEMES_UTF8`; width 0 marks a continuation cell.
+The verified read flow, one cell at a time:
 
 ```python
-"""Render state → immutable frames. Part of the native boundary."""
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any
-
-from ghostty_textual._native import Native
-from ghostty_textual.cells import Cell, CellStyle, StyleInterner
+WIDTH_BY_WIDE = {0: 1, 1: 2, 2: 0, 3: 0}  # NARROW, WIDE, SPACER_TAIL, SPACER_HEAD
 
 
-@dataclass(frozen=True, slots=True)
-class RowPatch:
-    y: int
-    cells: tuple[Cell, ...]
+def _read_cell(self, styles: StyleInterner, links: LinkInterner) -> Cell:
+    ffi, lib, native = self._native.ffi, self._native.lib, self._native
+    handle = ffi.new("GhosttyCell*")
+    native.check(
+        lib.ghostty_render_state_row_cells_get(
+            self._cells[0], lib.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, handle
+        ),
+        "cell RAW",
+    )
+    cell = handle[0]
 
+    def data(key: str, reader):
+        return reader(lib.ghostty_cell_get, cell, getattr(lib, f"GHOSTTY_CELL_DATA_{key}"), key)
 
-@dataclass(frozen=True, slots=True)
-class CursorState:
-    x: int
-    y: int
-    visible: bool
-    style: int
-    blinking: bool
-    wide_tail: bool
+    width = WIDTH_BY_WIDE[data("WIDE", native.get_enum)]
+    text = ""
+    if data("HAS_TEXT", native.get_bool):
+        codepoint = data("CODEPOINT", native.get_u32)
+        text = chr(codepoint) if codepoint else ""
+        if data("CONTENT_TAG", native.get_enum) == lib.GHOSTTY_CELL_CONTENT_CODEPOINT_GRAPHEME:
+            text = self._read_grapheme(cell, fallback=text)
 
+    style = DEFAULT_STYLE
+    if data("HAS_STYLING", native.get_bool):
+        style = self._read_style(cell)
 
-class RenderState:
-    def __init__(self, native: Native) -> None:
-        self._native = native
-        ffi, lib = native.ffi, native.lib
-        self._state = ffi.new("GhosttyRenderState*")
-        native.check(lib.ghostty_render_state_new(ffi.NULL, self._state), "render_state_new")
-        self._iterator = ffi.new("GhosttyRenderStateRowIterator*")
-        native.check(
-            lib.ghostty_render_state_row_iterator_new(ffi.NULL, self._iterator),
-            "row_iterator_new",
-        )
-        self._cells = ffi.new("GhosttyRenderStateRowCells*")
-        native.check(
-            lib.ghostty_render_state_row_cells_new(ffi.NULL, self._cells), "row_cells_new"
-        )
+    link_id = None
+    if data("HAS_HYPERLINK", native.get_bool):
+        link_id = self._read_link(cell, links)
 
-    def update(self, terminal: Any) -> None:
-        lib = self._native.lib
-        self._native.check(
-            lib.ghostty_render_state_update(self._state[0], terminal), "render_state_update"
-        )
-
-    def is_dirty(self) -> bool:
-        ffi, lib = self._native.ffi, self._native.lib
-        out = ffi.new("bool*")
-        self._native.check(
-            lib.ghostty_render_state_get(
-                self._state[0], lib.GHOSTTY_RENDER_STATE_DATA_DIRTY, out
-            ),
-            "get DIRTY",
-        )
-        return bool(out[0])
-
-    def read_rows(self, interner: StyleInterner, *, force: bool) -> tuple[RowPatch, ...]:
-        """Copy dirty rows (or all rows when `force`) and clear their dirty flags."""
-        ffi, lib = self._native.ffi, self._native.lib
-        self._native.check(
-            lib.ghostty_render_state_get(
-                self._state[0], lib.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, self._iterator
-            ),
-            "bind row iterator",
-        )
-        patches: list[RowPatch] = []
-        y = 0
-        clear = ffi.new("bool*", False)
-        dirty = ffi.new("bool*")
-        while lib.ghostty_render_state_row_iterator_next(self._iterator[0]):
-            self._native.check(
-                lib.ghostty_render_state_row_get(
-                    self._iterator[0], lib.GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, dirty
-                ),
-                "row DIRTY",
-            )
-            if force or dirty[0]:
-                patches.append(RowPatch(y=y, cells=self._read_row_cells(interner)))
-                lib.ghostty_render_state_row_set(
-                    self._iterator[0], lib.GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, clear
-                )
-            y += 1
-        return tuple(patches)
-
-    def _read_row_cells(self, interner: StyleInterner) -> tuple[Cell, ...]:
-        ffi, lib = self._native.ffi, self._native.lib
-        self._native.check(
-            lib.ghostty_render_state_row_get(
-                self._iterator[0], lib.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, self._cells
-            ),
-            "row CELLS",
-        )
-        cells: list[Cell] = []
-        while lib.ghostty_render_state_row_cells_next(self._cells[0]):
-            text = self._cell_text()
-            style = self._cell_style()
-            width = 0 if text == "" and cells and cells[-1].width == 2 else (2 if len(text.encode()) > 1 and self._is_wide(text) else 1)
-            cells.append(Cell(text=text, width=width, style_id=interner.intern(style)))
-        return tuple(cells)
-
-    def read_cursor(self) -> CursorState:
-        ffi, lib = self._native.ffi, self._native.lib
-
-        def flag(name: str) -> bool:
-            out = ffi.new("bool*")
-            self._native.check(
-                lib.ghostty_render_state_get(
-                    self._state[0], getattr(lib, f"GHOSTTY_RENDER_STATE_DATA_{name}"), out
-                ),
-                f"get {name}",
-            )
-            return bool(out[0])
-
-        def number(name: str) -> int:
-            out = ffi.new("uint16_t*")
-            self._native.check(
-                lib.ghostty_render_state_get(
-                    self._state[0], getattr(lib, f"GHOSTTY_RENDER_STATE_DATA_{name}"), out
-                ),
-                f"get {name}",
-            )
-            return int(out[0])
-
-        return CursorState(
-            x=number("CURSOR_VIEWPORT_X"),
-            y=number("CURSOR_VIEWPORT_Y"),
-            visible=flag("CURSOR_VISIBLE") and flag("CURSOR_VIEWPORT_HAS_VALUE"),
-            style=number("CURSOR_VISUAL_STYLE"),
-            blinking=flag("CURSOR_BLINKING"),
-            wide_tail=flag("CURSOR_VIEWPORT_WIDE_TAIL"),
-        )
-
-    def close(self) -> None:
-        lib = self._native.lib
-        for handle, free in (
-            (self._cells, lib.ghostty_render_state_row_cells_free),
-            (self._iterator, lib.ghostty_render_state_row_iterator_free),
-            (self._state, lib.ghostty_render_state_free),
-        ):
-            if handle is not None:
-                free(handle[0])
-        self._cells = self._iterator = self._state = None
+    return Cell(text=text, width=width, style_id=styles.intern(style), link_id=link_id)
 ```
 
-`_cell_text`, `_cell_style`, and the width determination follow directly from the
-Step 3 spike. Colours come from `ROW_CELLS_DATA_FG_COLOR`/`BG_COLOR` as
-`GhosttyColorRgb` (fields `r`, `g`, `b`, all `uint8_t`) — these are *resolved*
-values, which is exactly what the interner wants as its key, so a palette change
-produces new ids without separate invalidation. Attribute flags come from
-`ROW_CELLS_DATA_STYLE`. Skip both when `HAS_STYLING` is false and use
-`DEFAULT_STYLE`.
+Verified against `'\x1b[31ma\x1b[0m界b'` in a 10×1 terminal:
 
-- [ ] **Step 5: Run the tests to verify they pass**
+```
+x=0 codepoint=97    'a'  wide=NARROW      has_text=True  has_styling=True  style_id=1
+x=1 codepoint=30028 '界'  wide=WIDE        has_text=True  has_styling=False style_id=0
+x=2 codepoint=0          wide=SPACER_TAIL has_text=False
+x=3 codepoint=98    'b'  wide=NARROW      has_text=True
+```
 
-Run: `uv run pytest tests/test_render.py -v`
-Expected: 5 passed
+Three things to get right:
 
-- [ ] **Step 6: Add a wide-character test**
+1. `read_rows` clears **per-row** dirty via `row_set(iterator, ROW_OPTION_DIRTY, &false)`. A separate `clear_global_dirty()` calls `render_state_set(state, OPTION_DIRTY, &false)`. Both are required.
+2. `read_cursor()` checks `CURSOR_VIEWPORT_HAS_VALUE` **before** reading X/Y, and returns `visible=False` without reading them when it is false.
+3. `InternerFull` from `styles.intern` or `links.intern` propagates — Task 4's `snapshot()` handles it. Do not catch it here.
+
+Use `ghostty_cell_get_multi` for the common key set once the single-key version is green and tested; keep the single-key path as the differential reference.
+
+- [ ] **Step 4: Add `ViewportState` reading from the scrollbar struct**
 
 ```python
-def test_wide_character_produces_a_continuation_cell(native):
-    harness = make_terminal(native, cols=10, rows=1)
-    state = RenderState(native)
-    try:
-        harness.feed("界".encode())
-        state.update(harness.terminal)
-        cells = state.read_rows(StyleInterner(), force=True)[0].cells
-        assert cells[0].text == "界" and cells[0].width == 2
-        assert cells[1].width == 0
-    finally:
-        state.close()
-        harness.close()
+@dataclass(frozen=True, slots=True)
+class ViewportState:
+    at_bottom: bool
+    offset: int
+    scrollback_rows: int
+    total_rows: int
 ```
 
-Run: `uv run pytest tests/test_render.py -v`
-Expected: 6 passed
+`offset` comes from `GhosttyTerminalScrollbar {total, offset, len}` via
+`ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar)` —
+`SCROLLBACK_ROWS`/`TOTAL_ROWS`/`VIEWPORT_ACTIVE` alone cannot supply it.
+
+- [ ] **Step 5: Extend `REQUIRED_SYMBOLS` and `test_abi.py`**
+
+Add `ghostty_cell_get`, `ghostty_cell_get_multi`, `ghostty_row_get`, `ghostty_render_state_set`, `ghostty_render_state_row_cells_select`, `ghostty_render_state_colors_get`. Add an assertion that `GhosttyCell` and `GhosttyRow` are 8 bytes, so a future change from opaque handle to struct fails loudly.
+
+- [ ] **Step 6: Run everything; unmark the Task 1 xfail**
+
+Run: `uv run pytest -q`
+Expected: all pass
 
 - [ ] **Step 7: Lint and commit**
 
 ```bash
 uv run ruff check src tests
-git add src/ghostty_textual/_render.py tests/test_render.py
-git commit -m "feat: render state wrapper with dirty-row extraction"
+git add src/ghostty_textual/_render.py src/ghostty_textual/_native.py tests/test_render.py tests/test_abi.py tests/test_native_getters.py
+git commit -m "feat: render state extraction via the public cell accessor ABI"
 ```
 
 ---
@@ -570,46 +591,42 @@ git commit -m "feat: render state wrapper with dirty-row extraction"
 - Test: `tests/test_emulator_lifecycle.py`
 
 **Interfaces:**
-- Consumes: `Native`, `GhosttyError`, `load` from `_native`; `RenderState` from `_render`.
-- Produces: `Terminal(cols, rows, *, scrollback=5000, theme=None, clipboard=ClipboardPolicy(), limits=ResourceLimits())`; `Terminal.feed(bytes) -> TerminalEffects`; `.close()`; `.closed`; context manager. `TerminalEffects(pty_writes: tuple[bytes, ...], notifications: tuple[TerminalNotification, ...])`. `ClipboardPolicy`, `ResourceLimits`, `TitleChanged`, `BellRang`, `ClipboardWritten`.
+- Produces: `Terminal(cols, rows, *, scrollback=5000, theme=None, clipboard=ClipboardPolicy(), limits=ResourceLimits())`; `.feed(bytes) -> TerminalEffects`; `.close()`; `.closed`; context manager. `TerminalEffects(pty_writes, notifications)`. `ClipboardPolicy(allow_write=False, max_bytes=1_000_000)`. `ResourceLimits(max_interned_styles=4096, max_interned_links=1024, max_link_uri_bytes=2048, kitty_image_storage_bytes=0, apc_max_bytes=8192, apc_max_bytes_kitty=8192, notification_rate_per_sec=60)`. Notifications `TitleChanged`, `BellRang`, `ClipboardWritten`.
+
+`ResourceLimits` carries the APC fields **now** so Task 12 can derive terminal options from it without changing the type.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_emulator_lifecycle.py
 import pytest
-from ghostty_textual._native import GhosttyError
 from ghostty_textual.emulator import BellRang, Terminal, TitleChanged
 
 
-def test_feed_returns_query_replies_as_pty_writes():
+def test_feed_returns_query_replies():
     with Terminal(80, 24) as terminal:
         assert terminal.feed(b"\x1b[6n").pty_writes == (b"\x1b[1;1R",)
 
 
-def test_pty_writes_preserve_order_within_one_feed():
+def test_pty_writes_preserve_order():
     with Terminal(80, 24) as terminal:
-        effects = terminal.feed(b"\x1b[6n\x1b[c")
-        assert effects.pty_writes == (b"\x1b[1;1R", b"\x1b[?62;22c")
+        assert terminal.feed(b"\x1b[6n\x1b[c").pty_writes == (b"\x1b[1;1R", b"\x1b[?62;22c")
 
 
-def test_title_change_is_reported_as_a_notification():
+def test_title_change_is_notified():
     with Terminal(80, 24) as terminal:
-        effects = terminal.feed(b"\x1b]0;hello\x07")
-        assert TitleChanged(title="hello") in effects.notifications
+        assert TitleChanged(title="hello") in terminal.feed(b"\x1b]0;hello\x07").notifications
         assert terminal.title == "hello"
 
 
-def test_bell_is_reported():
+def test_bell_is_notified():
     with Terminal(80, 24) as terminal:
         assert any(isinstance(n, BellRang) for n in terminal.feed(b"\x07").notifications)
 
 
-def test_clipboard_write_is_refused_by_default():
-    """OSC 52 is an exfiltration vector; spec v2 §6.11 defaults it off."""
+def test_clipboard_write_refused_by_default():
     with Terminal(80, 24) as terminal:
-        effects = terminal.feed(b"\x1b]52;c;aGVsbG8=\x07")
-        assert effects.notifications == ()
+        assert terminal.feed(b"\x1b]52;c;aGVsbG8=\x07").notifications == ()
 
 
 def test_close_is_idempotent():
@@ -619,131 +636,111 @@ def test_close_is_idempotent():
     assert terminal.closed
 
 
-def test_every_operation_after_close_raises():
+def test_operations_after_close_raise():
     terminal = Terminal(80, 24)
     terminal.close()
     with pytest.raises(RuntimeError):
         terminal.feed(b"x")
 
 
-def test_malformed_bytes_are_not_an_error():
-    """libghostty handles untrusted input; only wrapper bugs raise."""
+def test_malformed_bytes_are_not_errors():
     with Terminal(80, 24) as terminal:
         terminal.feed(b"\x1b[?4m")          # the CSI that froze pyte
         terminal.feed(b"\xff\xfe\x00garbage")
         terminal.feed(b"\x1b[999999999J")
 
 
-def test_utf8_split_across_feeds_is_reassembled():
-    with Terminal(80, 24) as terminal:
-        terminal.feed(b"\xe2\x94")
-        terminal.feed(b"\x80")
-        frame = terminal.snapshot(force=True)
-        assert frame.row_patches[0].cells[0].text == "─"
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `uv run pytest tests/test_emulator_lifecycle.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'ghostty_textual.emulator'`
-
-- [ ] **Step 3: Implement `emulator.py` lifecycle and feed**
-
-Requirements the tests do not fully express:
-- The `WRITE_PTY` callback **only appends to a list**. It must not call `vt_write`, await, or block — it fires synchronously inside `ghostty_terminal_vt_write`.
-- Exceptions raised inside any CFFI callback are captured and re-raised as `GhosttyError` **after** `vt_write` returns, never allowed to unwind through C.
-- All callback objects live in `self._keepalive` until after `ghostty_terminal_free`.
-- Record `threading.get_ident()` at construction; assert it in every public method under `if __debug__`.
-- Register `OPT_SIZE` returning cached rows/columns with `cell_width = cell_height = 0` (spec §3.4).
-
-```python
-@dataclass(frozen=True, slots=True)
-class TerminalEffects:
-    pty_writes: tuple[bytes, ...] = ()
-    notifications: tuple[TerminalNotification, ...] = ()
-
-
-class Terminal:
-    def feed(self, data: bytes) -> TerminalEffects:
-        self._assert_usable()
-        self._pending_writes.clear()
-        self._pending_notifications.clear()
-        self._callback_error = None
-        self._lib.ghostty_terminal_vt_write(self._terminal, data, len(data))
-        if self._callback_error is not None:
-            raise GhosttyError("callback failed during feed") from self._callback_error
-        return TerminalEffects(
-            pty_writes=tuple(self._pending_writes),
-            notifications=tuple(self._pending_notifications),
-        )
-```
-
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `uv run pytest tests/test_emulator_lifecycle.py -v`
-Expected: 9 passed (the last one needs Task 4's `snapshot`; mark it `xfail` now and remove the marker in Task 4)
-
-- [ ] **Step 5: Add leak-loop and thread-affinity tests**
-
-```python
-def test_create_feed_close_loop_does_not_leak_handles():
+def test_create_feed_close_loop_does_not_leak():
     for _ in range(200):
         with Terminal(80, 24) as terminal:
             terminal.feed(b"hello\r\n")
 
 
 def test_use_from_another_thread_is_rejected():
-    """libghostty-vt is not thread-safe; the confinement must be enforced."""
     import threading
 
     failures: list[BaseException] = []
     with Terminal(80, 24) as terminal:
-        def other_thread() -> None:
+        def other() -> None:
             try:
                 terminal.feed(b"x")
             except BaseException as exc:
                 failures.append(exc)
 
-        thread = threading.Thread(target=other_thread)
+        thread = threading.Thread(target=other)
         thread.start()
         thread.join()
     assert failures and isinstance(failures[0], RuntimeError)
 ```
 
+- [ ] **Step 2: Run to verify they fail**
+
 Run: `uv run pytest tests/test_emulator_lifecycle.py -v`
+Expected: FAIL — `ModuleNotFoundError`
+
+- [ ] **Step 3: Implement lifecycle and feed**
+
+- `WRITE_PTY` callback **only appends to a list**. No `vt_write`, no await, no blocking — it fires synchronously inside `ghostty_terminal_vt_write`.
+- Exceptions inside any CFFI callback are captured to `self._callback_error` and re-raised as `GhosttyError` **after** `vt_write` returns. Never unwind through C.
+- Callback objects live in `self._keepalive` until after `ghostty_terminal_free`.
+- Record `threading.get_ident()` at construction; check it in every public method.
+- Register `OPT_SIZE` returning cached rows/columns with `cell_width = cell_height = 0` (spec §3.4), and the `KITTY_IMAGE_STORAGE_LIMIT`/`APC_MAX_BYTES` options from `limits`.
+
+- [ ] **Step 4: Run to verify they pass**
+
+Run: `uv run pytest tests/test_emulator_lifecycle.py -v`
+Expected: 10 passed
+
+- [ ] **Step 5: Extend `REQUIRED_SYMBOLS`/`test_abi.py`** with any newly called symbols.
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
 uv run ruff check src tests
-git add src/ghostty_textual/emulator.py tests/test_emulator_lifecycle.py
+git add src/ghostty_textual/emulator.py src/ghostty_textual/_native.py tests/
 git commit -m "feat: Terminal lifecycle, feed, and effect collection"
 ```
 
 ---
 
-### Task 4: Snapshot and frames
+### Task 4: Self-contained frames and snapshot
 
 **Files:**
 - Modify: `src/ghostty_textual/emulator.py`
 - Test: `tests/test_emulator_frames.py`
 
 **Interfaces:**
-- Consumes: `RenderState`, `RowPatch`, `CursorState`, `StyleInterner`.
-- Produces: `Terminal.snapshot(*, force: bool = False) -> Frame | None`; `Frame(generation, cols, rows, full_redraw, row_patches, cursor, viewport, frame_pending)`.
+- Produces: `Terminal.snapshot(*, force=False) -> Frame | None`;
+
+```python
+@dataclass(frozen=True, slots=True)
+class Frame:
+    generation: int
+    cols: int
+    rows: int
+    full_redraw: bool
+    row_patches: tuple[RowPatch, ...]
+    styles: tuple[CellStyle, ...]   # index == style_id, complete for this generation
+    links: tuple[str, ...]          # index == link_id
+    cursor: CursorState
+    viewport: ViewportState
+    frame_pending: bool
+```
+
+**Frames are self-contained.** v1 of this plan gave the widget `style_id` with no way to resolve it and no way to swap tables atomically on rollover. Carrying the complete generation-scoped tables inside the frame makes the widget's update a single assignment and removes the whole class of torn-generation bugs.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_emulator_frames.py
-from ghostty_textual.emulator import Terminal
+from ghostty_textual.cells import DEFAULT_STYLE
+from ghostty_textual.emulator import ResourceLimits, Terminal
 
 
-def test_snapshot_after_output_returns_a_frame():
+def test_snapshot_returns_a_frame_after_output():
     with Terminal(20, 3) as terminal:
         terminal.feed(b"hello")
         frame = terminal.snapshot()
-        assert frame is not None
         assert "".join(c.text for c in frame.row_patches[0].cells).rstrip() == "hello"
 
 
@@ -754,13 +751,12 @@ def test_snapshot_with_no_change_returns_none():
         assert terminal.snapshot() is None
 
 
-def test_force_returns_a_full_frame_even_when_clean():
+def test_force_returns_a_full_frame():
     with Terminal(20, 3) as terminal:
         terminal.feed(b"hello")
         terminal.snapshot()
         frame = terminal.snapshot(force=True)
-        assert frame is not None and frame.full_redraw
-        assert len(frame.row_patches) == 3
+        assert frame.full_redraw and len(frame.row_patches) == 3
 
 
 def test_only_changed_rows_are_patched():
@@ -768,35 +764,41 @@ def test_only_changed_rows_are_patched():
         terminal.feed(b"a\r\nb\r\nc")
         terminal.snapshot()
         terminal.feed(b"\x1b[1;1Hz")
+        assert [p.y for p in terminal.snapshot().row_patches] == [0]
+
+
+def test_frame_carries_a_resolvable_style_table():
+    with Terminal(20, 3) as terminal:
+        terminal.feed(b"\x1b[31mred\x1b[0m")
         frame = terminal.snapshot()
-        assert [p.y for p in frame.row_patches] == [0]
+        cell = frame.row_patches[0].cells[0]
+        assert frame.styles[cell.style_id].fg is not None
 
 
 def test_resize_produces_a_frame_without_a_feed():
-    """Spec v2 §3.1: mutations other than feed must still be describable."""
     with Terminal(20, 3) as terminal:
         terminal.feed(b"hello")
         terminal.snapshot()
         terminal.resize(40, 6)
         frame = terminal.snapshot()
-        assert frame is not None and (frame.cols, frame.rows) == (40, 6)
+        assert (frame.cols, frame.rows) == (40, 6)
 
 
-def test_frame_carries_the_intern_generation():
-    with Terminal(20, 3) as terminal:
-        terminal.feed(b"hi")
-        assert terminal.snapshot().generation == 0
-
-
-def test_style_rollover_forces_a_full_frame():
-    with Terminal(20, 3, limits=ResourceLimits(max_interned_styles=4)) as terminal:
+def test_style_overflow_rolls_over_within_one_snapshot():
+    """The rollover must complete in the snapshot that overflows, not the next one."""
+    limits = ResourceLimits(max_interned_styles=4)
+    with Terminal(20, 3, limits=limits) as terminal:
         terminal.feed(b"hi")
         first = terminal.snapshot()
-        for value in range(10):
+        for value in range(20):
             terminal.feed(f"\x1b[38;2;{value};0;0mx".encode())
         second = terminal.snapshot()
         assert second.generation > first.generation
         assert second.full_redraw
+        assert len(second.styles) <= 4
+        for patch in second.row_patches:
+            for cell in patch.cells:
+                assert 0 <= cell.style_id < len(second.styles)
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -804,45 +806,69 @@ def test_style_rollover_forces_a_full_frame():
 Run: `uv run pytest tests/test_emulator_frames.py -v`
 Expected: FAIL — `AttributeError: 'Terminal' object has no attribute 'snapshot'`
 
-- [ ] **Step 3: Implement `snapshot()`**
+- [ ] **Step 3: Implement `snapshot()` with restart-on-overflow**
 
-Critical ordering, from spec §3.1 and §4:
-1. `render_state.update(terminal)`.
-2. If not `force` and not `is_dirty()` and no pending rollover → return `None`.
-3. If `interner.rollover_pending` → `interner.rollover()`, set `force = True`.
-4. Read rows (which clears per-row dirty flags), read cursor, read viewport.
-5. Build the immutable `Frame`, stamping the current `interner.generation`.
+```python
+def snapshot(self, *, force: bool = False) -> Frame | None:
+    self._assert_usable()
+    self._render.update(self._terminal)
+    if not force and not self._render.is_dirty():
+        return None
+    for attempt in (1, 2):
+        try:
+            patches = self._render.read_rows(self._styles, self._links, force=force)
+        except InternerFull:
+            # The table filled mid-extraction. Discard the partial result, roll
+            # over both tables, and restart as a forced full extraction. The
+            # second attempt cannot overflow: a full frame interns at most
+            # cols*rows distinct styles, and the limit is validated above that.
+            self._styles.rollover()
+            self._links.rollover()
+            self._render.update(self._terminal)
+            force = True
+            continue
+        break
+    else:
+        raise GhosttyError("style interning failed twice in one snapshot")
+    cursor = self._render.read_cursor()
+    viewport = self._read_viewport()
+    self._render.clear_global_dirty()
+    return Frame(
+        generation=self._styles.generation,
+        cols=self._cols, rows=self._rows,
+        full_redraw=force,
+        row_patches=patches,
+        styles=self._styles.table(),
+        links=self._links.table(),
+        cursor=cursor, viewport=viewport,
+        frame_pending=self._frame_pending,
+    )
+```
 
-Document on the method that dirty state is cleared before returning, so a caller that raises while applying a frame must recover with `snapshot(force=True)`.
+Validate at construction that `max_interned_styles >= cols * rows` is achievable, or clamp and document; otherwise the restart guarantee does not hold.
+
+Document on the method: dirty state is cleared before returning, so a caller that raises while applying a frame must recover with `snapshot(force=True)`.
 
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `uv run pytest tests/test_emulator_frames.py -v`
 Expected: 7 passed
 
-- [ ] **Step 5: Remove the xfail from Task 3's UTF-8 test and run the whole suite**
-
-Run: `uv run pytest -q`
-Expected: all pass
-
-- [ ] **Step 6: Lint and commit**
+- [ ] **Step 5: Lint and commit**
 
 ```bash
 uv run ruff check src tests
 git add src/ghostty_textual/emulator.py tests/test_emulator_frames.py
-git commit -m "feat: snapshot() with dirty-row frames and generation stamping"
+git commit -m "feat: self-contained frames with restart-on-interner-overflow"
 ```
 
 ---
 
 ### Task 5: Viewport and scrollback
 
-**Files:**
-- Modify: `src/ghostty_textual/emulator.py`
-- Test: `tests/test_viewport.py`
+**Files:** Modify `src/ghostty_textual/emulator.py`; Test `tests/test_viewport.py`
 
-**Interfaces:**
-- Produces: `Terminal.scroll_viewport(request: ScrollRequest)`, `.scroll_to_top()`, `.scroll_to_bottom()`, `.viewport -> ViewportState`. `ScrollRequest` = `ScrollTop() | ScrollBottom() | ScrollDelta(n) | ScrollToRow(n)`. `ViewportState(at_bottom, offset, scrollback_rows, total_rows)`.
+**Interfaces:** `Terminal.scroll_viewport(ScrollRequest)`, `.scroll_to_top()`, `.scroll_to_bottom()`, `.viewport -> ViewportState`. `ScrollRequest` = `ScrollTop() | ScrollBottom() | ScrollDelta(n) | ScrollToRow(n)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -860,19 +886,22 @@ def test_fresh_terminal_is_at_bottom():
         assert terminal.viewport.at_bottom
 
 
-def test_scrolling_to_top_leaves_the_bottom():
+def test_scroll_to_top_then_bottom():
     with Terminal(20, 5, scrollback=1000) as terminal:
         _fill(terminal)
         terminal.scroll_to_top()
         assert not terminal.viewport.at_bottom
-
-
-def test_scroll_to_bottom_resumes_following():
-    with Terminal(20, 5, scrollback=1000) as terminal:
-        _fill(terminal)
-        terminal.scroll_to_top()
         terminal.scroll_to_bottom()
         assert terminal.viewport.at_bottom
+
+
+def test_offset_is_reported_from_the_scrollbar():
+    with Terminal(20, 5, scrollback=1000) as terminal:
+        _fill(terminal)
+        terminal.scroll_to_bottom()
+        bottom = terminal.viewport.offset
+        terminal.scroll_to_top()
+        assert terminal.viewport.offset != bottom
 
 
 def test_scrolled_content_stays_anchored_while_output_arrives():
@@ -880,79 +909,139 @@ def test_scrolled_content_stays_anchored_while_output_arrives():
     with Terminal(20, 5, scrollback=1000) as terminal:
         _fill(terminal)
         terminal.scroll_to_top()
-        before = terminal.snapshot(force=True)
-        before_text = [
-            "".join(c.text for c in patch.cells).rstrip() for patch in before.row_patches
-        ]
+        before = ["".join(c.text for c in p.cells).rstrip()
+                  for p in terminal.snapshot(force=True).row_patches]
         terminal.feed(b"newline\r\n" * 3)
-        after = terminal.snapshot(force=True)
-        after_text = [
-            "".join(c.text for c in patch.cells).rstrip() for patch in after.row_patches
-        ]
-        assert before_text == after_text
+        after = ["".join(c.text for c in p.cells).rstrip()
+                 for p in terminal.snapshot(force=True).row_patches]
+        assert before == after
 
 
-def test_scrollback_is_bounded_by_the_configured_limit():
+def test_scrollback_is_bounded():
     with Terminal(20, 5, scrollback=10) as terminal:
         _fill(terminal, count=200)
         assert terminal.viewport.scrollback_rows <= 10
 
 
-def test_scroll_delta_moves_by_the_requested_rows():
+def test_scroll_delta_moves():
     with Terminal(20, 5, scrollback=1000) as terminal:
         _fill(terminal)
         terminal.scroll_viewport(ScrollDelta(-3))
         assert not terminal.viewport.at_bottom
-```
 
-- [ ] **Step 2: Run to verify they fail**
 
-Run: `uv run pytest tests/test_viewport.py -v`
-Expected: FAIL — `ImportError: cannot import name 'ScrollDelta'`
-
-- [ ] **Step 3: Implement viewport**
-
-Use `Native.scroll_viewport(terminal, tag, value)` — the struct twin from `_native.py`, already verified working. Tags: `GHOSTTY_SCROLL_VIEWPORT_TOP`, `_BOTTOM`, `_DELTA`, `_ROW`. `ViewportState` reads `SCROLLBACK_ROWS`, `TOTAL_ROWS`, and `VIEWPORT_ACTIVE` (measured: `1` at bottom, `0` when scrolled up).
-
-- [ ] **Step 4: Run to verify they pass**
-
-Run: `uv run pytest tests/test_viewport.py -v`
-Expected: 6 passed
-
-- [ ] **Step 5: Add a reflow test**
-
-```python
 def test_resize_while_scrolled_clamps_safely():
     with Terminal(20, 5, scrollback=1000) as terminal:
         _fill(terminal)
         terminal.scroll_to_top()
         terminal.resize(10, 3)
         state = terminal.viewport
-        assert 0 <= state.offset <= state.scrollback_rows
+        assert 0 <= state.offset <= state.total_rows
 ```
 
-Run: `uv run pytest tests/test_viewport.py -v`
-Expected: 7 passed
+- [ ] **Step 2: Run to verify they fail** — `uv run pytest tests/test_viewport.py -v`
+
+- [ ] **Step 3: Implement** using `Native.scroll_viewport` (the struct twin, already verified) and the `GhosttyTerminalScrollbar` read from Task 2.
+
+- [ ] **Step 4: Run to verify they pass** — Expected: 7 passed
+
+- [ ] **Step 5: Extend `REQUIRED_SYMBOLS`/`test_abi.py`**
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-uv run ruff check src tests
-git add src/ghostty_textual/emulator.py tests/test_viewport.py
-git commit -m "feat: viewport scrolling via the struct-twin shim"
+git add src/ghostty_textual/emulator.py tests/test_viewport.py src/ghostty_textual/_native.py tests/test_abi.py
+git commit -m "feat: viewport scrolling with scrollbar-derived offset"
 ```
 
 ---
 
-### Task 6: Theme, hard reset, and resize
+### Task 6: Terminal modes and synchronized output
 
-**Files:**
-- Create: `src/ghostty_textual/theme.py`
-- Modify: `src/ghostty_textual/emulator.py`
-- Test: `tests/test_theme.py`, `tests/test_hard_reset.py`
+**Files:** Modify `src/ghostty_textual/emulator.py`; Test `tests/test_modes.py`
 
-**Interfaces:**
-- Produces: `TerminalTheme(foreground: Rgb, background: Rgb, cursor: Rgb | None, palette: tuple[Rgb, ...])` with `.from_textual(app_theme)`; `Terminal.set_theme(theme)`; `Terminal.hard_reset()`; `Terminal.theme -> TerminalTheme | None`; `Terminal.colour_override_foreground -> Rgb | None` (reads `GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND`, which returns `rc=-4` and therefore `None` when the guest has set no override).
+**Interfaces:** `Terminal.modes -> TerminalModes(bracketed_paste, focus_events, app_cursor_keys, alt_screen, mouse_tracking, mouse_encoding, sync_output)`; `Frame.frame_pending`.
+
+This task exists because spec v2 specifies `TerminalModes` and synchronized-output behaviour, and v1 of this plan had no task for either.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_modes.py
+from ghostty_textual.emulator import Terminal
+
+
+def test_bracketed_paste_mode_is_observable():
+    with Terminal(20, 3) as terminal:
+        assert not terminal.modes.bracketed_paste
+        terminal.feed(b"\x1b[?2004h")
+        assert terminal.modes.bracketed_paste
+
+
+def test_application_cursor_keys_mode():
+    with Terminal(20, 3) as terminal:
+        assert not terminal.modes.app_cursor_keys
+        terminal.feed(b"\x1b[?1h")
+        assert terminal.modes.app_cursor_keys
+
+
+def test_alternate_screen_mode():
+    with Terminal(20, 3) as terminal:
+        terminal.feed(b"\x1b[?1049h")
+        assert terminal.modes.alt_screen
+        terminal.feed(b"\x1b[?1049l")
+        assert not terminal.modes.alt_screen
+
+
+def test_focus_event_mode():
+    with Terminal(20, 3) as terminal:
+        terminal.feed(b"\x1b[?1004h")
+        assert terminal.modes.focus_events
+
+
+def test_synchronized_output_is_observable():
+    with Terminal(20, 3) as terminal:
+        terminal.feed(b"\x1b[?2026h")
+        assert terminal.modes.sync_output
+
+
+def test_unterminated_synchronized_frame_still_yields_a_snapshot():
+    """A missing terminator must never freeze the widget indefinitely."""
+    with Terminal(20, 3) as terminal:
+        terminal.feed(b"\x1b[?2026h")   # begin, never end
+        terminal.feed(b"hello")
+        assert terminal.snapshot(force=True) is not None
+```
+
+- [ ] **Step 2: Run to verify they fail** — `uv run pytest tests/test_modes.py -v`
+
+- [ ] **Step 3: Implement modes via `ghostty_terminal_mode_get`**
+
+Then **measure before building anything**: does libghostty already withhold render-state dirty flags inside a synchronized frame? Write a scratch script that feeds `?2026h`, some output, then `?2026l`, checking `is_dirty()` at each point. Record the answer as a comment.
+
+- If libghostty already gates: `frame_pending` simply reports `modes.sync_output` and no withholding logic is written.
+- If it does not: `snapshot()` withholds while `sync_output` is set, with a bounded timeout (default 150 ms) after which it snapshots anyway.
+
+Spec §3.1 requires measuring first rather than reimplementing DECSET 2026 speculatively.
+
+- [ ] **Step 4: Run to verify they pass** — Expected: 6 passed
+
+- [ ] **Step 5: Extend `REQUIRED_SYMBOLS`/`test_abi.py`** with `ghostty_terminal_mode_get`.
+
+- [ ] **Step 6: Lint and commit**
+
+```bash
+git add src/ghostty_textual/emulator.py tests/test_modes.py src/ghostty_textual/_native.py tests/test_abi.py
+git commit -m "feat: terminal mode queries and synchronized output handling"
+```
+
+---
+
+### Task 7: Theme and hard reset
+
+**Files:** Create `src/ghostty_textual/theme.py`; Modify `emulator.py`; Test `tests/test_theme.py`, `tests/test_hard_reset.py`
+
+**Interfaces:** `TerminalTheme(foreground, background, cursor, palette)` with `.from_textual(app_theme)`; `Terminal.set_theme(theme)`; `.theme`; `.hard_reset()`; `.colour_override_foreground -> Rgb | None` (reads `COLOR_FOREGROUND`, which returns `rc=-4` — hence `None` — when the guest set no override).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -971,13 +1060,11 @@ def test_hard_reset_clears_scrollback_and_title():
 
 
 def test_hard_reset_clears_osc_colour_overrides():
-    """The C reset preserves these -- which is why hard_reset recreates."""
+    """ghostty_terminal_reset() preserves these -- which is why we recreate."""
     with Terminal(20, 5) as terminal:
         terminal.feed(b"\x1b]10;#ff0000\x07")
+        assert terminal.colour_override_foreground is not None
         terminal.hard_reset()
-        frame = terminal.snapshot(force=True)
-        assert frame is not None
-        # The recreated terminal reports no override.
         assert terminal.colour_override_foreground is None
 
 
@@ -992,35 +1079,30 @@ def test_hard_reset_preserves_configuration():
         terminal.hard_reset()
         terminal.feed(b"".join(b"l%d\r\n" % i for i in range(300)))
         assert terminal.viewport.scrollback_rows <= 77
+
+
+def test_hard_reset_resets_interner_generation():
+    with Terminal(20, 5) as terminal:
+        terminal.feed(b"\x1b[31mx\x1b[0m")
+        terminal.snapshot()
+        terminal.hard_reset()
+        assert terminal.snapshot(force=True).generation == 0
 ```
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `uv run pytest tests/test_hard_reset.py -v`
-Expected: FAIL — `AttributeError: 'Terminal' object has no attribute 'hard_reset'`
+- [ ] **Step 3: Implement `hard_reset()` as free-and-recreate** — free terminal, render state, iterators, encoders; drop the keepalive list; rebuild from retained `cols`, `rows`, `scrollback`, `theme`, `clipboard`, `limits`; reset both interners to generation 0.
 
-- [ ] **Step 3: Implement `hard_reset()` as free-and-recreate**
+Keep `ghostty_terminal_reset()` available separately for a guest-initiated RIS (`ESC c`), where preserving embedder colours is correct.
 
-Free the terminal, render state, iterators, and encoders; drop the callback keepalive list; rebuild everything from the retained `cols`, `rows`, `scrollback`, `theme`, `clipboard`, `limits`. Reset the interner to generation 0 and force the next snapshot to be full.
+- [ ] **Step 4: Run to verify they pass** — Expected: 5 passed
 
-Keep `ghostty_terminal_reset()` available separately for a guest-initiated RIS (`ESC c`), where preserving embedder colour configuration is correct.
-
-- [ ] **Step 4: Run to verify they pass**
-
-Run: `uv run pytest tests/test_hard_reset.py -v`
-Expected: 4 passed
-
-- [ ] **Step 5: Implement `theme.py` and `set_theme`, with tests**
+- [ ] **Step 5: Implement `theme.py` and `set_theme` with tests**
 
 ```python
 # tests/test_theme.py
-from ghostty_textual.emulator import Terminal
-from ghostty_textual.theme import TerminalTheme
-
-DARK = TerminalTheme(
-    foreground=(200, 200, 200), background=(20, 20, 20), cursor=(255, 255, 255),
-    palette=tuple((i, i, i) for i in range(256)),
-)
+DARK = TerminalTheme(foreground=(200, 200, 200), background=(20, 20, 20),
+                     cursor=(255, 255, 255), palette=tuple((i, i, i) for i in range(256)))
 
 
 def test_theme_is_applied_at_construction():
@@ -1033,32 +1115,23 @@ def test_set_theme_forces_a_full_frame():
         terminal.feed(b"hi")
         terminal.snapshot()
         terminal.set_theme(DARK)
-        frame = terminal.snapshot()
-        assert frame is not None and frame.full_redraw
+        assert terminal.snapshot().full_redraw
 ```
-
-Run: `uv run pytest tests/test_theme.py -v`
-Expected: 2 passed
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-uv run ruff check src tests
 git add src/ghostty_textual/theme.py src/ghostty_textual/emulator.py tests/test_theme.py tests/test_hard_reset.py
 git commit -m "feat: theme configuration and free-and-recreate hard reset"
 ```
 
 ---
 
-### Task 7: Input encoders
+### Task 8: Input encoders
 
-**Files:**
-- Create: `src/ghostty_textual/keys.py`
-- Modify: `src/ghostty_textual/emulator.py`
-- Test: `tests/test_encoders.py`
+**Files:** Create `src/ghostty_textual/keys.py`; Modify `emulator.py`; Test `tests/test_encoders.py`
 
-**Interfaces:**
-- Produces: `KeyEvent(key: str, text: str | None, ctrl: bool, alt: bool, shift: bool, meta: bool)`; `Terminal.encode_key(event) -> bytes | None`; `.encode_focus(bool) -> bytes | None`; `.encode_paste(str) -> bytes`; `.encode_mouse(MouseEvent) -> bytes | None`. `keys.from_textual(event) -> KeyEvent | None`.
+**Interfaces:** `KeyEvent(key, text=None, ctrl=False, alt=False, shift=False, meta=False)`; `Terminal.encode_key(event) -> bytes | None`; `.encode_focus(bool) -> bytes | None`; **`.encode_paste(str) -> bytes | None`**; `.encode_mouse(MouseEvent) -> bytes | None`; `keys.from_textual(event) -> KeyEvent | None`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1074,7 +1147,7 @@ def test_plain_character():
 
 def test_enter_is_carriage_return():
     with Terminal(20, 3) as terminal:
-        assert terminal.encode_key(KeyEvent(key="enter", text=None)) == b"\r"
+        assert terminal.encode_key(KeyEvent(key="enter")) == b"\r"
 
 
 def test_ctrl_c():
@@ -1085,11 +1158,9 @@ def test_ctrl_c():
 def test_cursor_keys_follow_decckm():
     """The gap ADR-0001 lists as knowingly accepted under pyte."""
     with Terminal(20, 3) as terminal:
-        normal = terminal.encode_key(KeyEvent(key="up", text=None))
-        terminal.feed(b"\x1b[?1h")  # DECCKM on: application cursor keys
-        application = terminal.encode_key(KeyEvent(key="up", text=None))
-        assert normal == b"\x1b[A"
-        assert application == b"\x1bOA"
+        assert terminal.encode_key(KeyEvent(key="up")) == b"\x1b[A"
+        terminal.feed(b"\x1b[?1h")
+        assert terminal.encode_key(KeyEvent(key="up")) == b"\x1bOA"
 
 
 def test_paste_is_bracketed_when_the_mode_is_set():
@@ -1099,10 +1170,16 @@ def test_paste_is_bracketed_when_the_mode_is_set():
         assert terminal.encode_paste("hi") == b"\x1b[200~hi\x1b[201~"
 
 
-def test_unsafe_paste_is_rejected():
-    """ghostty_paste_is_safe guards control characters in an unbracketed paste."""
+def test_unsafe_unbracketed_paste_is_refused():
     with Terminal(20, 3) as terminal:
         assert terminal.encode_paste("rm -rf /\n") is None
+
+
+def test_unsafe_paste_is_allowed_when_bracketed():
+    """Bracketing is what makes control characters safe to deliver."""
+    with Terminal(20, 3) as terminal:
+        terminal.feed(b"\x1b[?2004h")
+        assert terminal.encode_paste("a\nb") is not None
 
 
 def test_focus_events_only_when_enabled():
@@ -1113,36 +1190,29 @@ def test_focus_events_only_when_enabled():
         assert terminal.encode_focus(False) == b"\x1b[O"
 
 
-def test_unrepresentable_key_returns_none():
+def test_a_key_with_no_representation_returns_none():
+    """Textual can deliver names Ghostty has no keycode for."""
     with Terminal(20, 3) as terminal:
-        assert terminal.encode_key(KeyEvent(key="f25", text=None)) is None
+        assert terminal.encode_key(KeyEvent(key="unknown_synthetic_key")) is None
 ```
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `uv run pytest tests/test_encoders.py -v`
-Expected: FAIL — `ImportError: cannot import name 'KeyEvent'`
+- [ ] **Step 3: Implement**
 
-- [ ] **Step 3: Implement the encoders**
+**Call `ghostty_key_encoder_setopt_from_terminal(encoder, terminal)` before every `encode_key`.** That is what makes DECCKM, keypad mode, modifyOtherKeys, Kitty flags, and backarrow mode reflect current state — the entire reason for using libghostty's encoder over a hand-rolled table.
 
-**Call `ghostty_key_encoder_setopt_from_terminal(encoder, terminal)` before every `encode_key`.** That is what makes DECCKM, keypad mode, modifyOtherKeys, Kitty flags, and backarrow mode reflect current state rather than construction-time state — the whole reason for using libghostty's encoder instead of a hand-rolled table.
+`encode_paste` returns `None` when `ghostty_paste_is_safe()` is false **and** bracketed paste is off.
 
-`encode_paste` returns `None` when `ghostty_paste_is_safe()` is false and bracketed paste is off.
+`encode_mouse` is implemented and tested headlessly. **No widget-level remote mouse in v1** (spec §6.8).
 
-`encode_mouse` is implemented here and tested headlessly. **No widget-level remote mouse in v1** (spec §6.8).
+Note: F13–F25 *are* valid Ghostty keycodes; do not use them as the unrepresentable-key case.
 
-- [ ] **Step 4: Run to verify they pass**
+- [ ] **Step 4: Run to verify they pass** — Expected: 9 passed
 
-Run: `uv run pytest tests/test_encoders.py -v`
-Expected: 8 passed
-
-- [ ] **Step 5: Add the Textual translation layer and its test**
+- [ ] **Step 5: Add `keys.from_textual` and its tests**
 
 ```python
-# in tests/test_encoders.py
-from ghostty_textual.keys import from_textual
-
-
 class FakeKey:
     def __init__(self, key, character=None):
         self.key, self.character = key, character
@@ -1154,57 +1224,95 @@ def test_textual_key_names_translate():
     assert from_textual(FakeKey("pageup")).key == "pageup"
 ```
 
-Run: `uv run pytest tests/test_encoders.py -v`
+- [ ] **Step 6: Extend `REQUIRED_SYMBOLS`/`test_abi.py`** with the key-event lifecycle symbols.
 
-- [ ] **Step 6: Lint and commit**
+- [ ] **Step 7: Lint and commit**
 
 ```bash
-uv run ruff check src tests
-git add src/ghostty_textual/keys.py src/ghostty_textual/emulator.py tests/test_encoders.py
+git add src/ghostty_textual/keys.py src/ghostty_textual/emulator.py tests/test_encoders.py src/ghostty_textual/_native.py tests/test_abi.py
 git commit -m "feat: key, paste, focus, and mouse encoders via libghostty"
 ```
 
 ---
 
-### Task 8: TerminalView rendering and sizing
+### Task 9: TerminalView rendering and sizing
 
-**Files:**
-- Create: `src/ghostty_textual/widget.py`
-- Test: `tests/test_widget_render.py`
+**Files:** Create `src/ghostty_textual/widget.py`; Create `tests/widget_harness.py`; Test `tests/test_widget_render.py`
 
-**Interfaces:**
-- Produces: `TerminalView(*, send, resize_transport=None, scrollback=5000, theme=None, reserved_keys=frozenset(), terminal=None, close_terminal=False)`; `.feed(bytes)`; `.sync_terminal_size() -> tuple[int, int]`; `.terminal`; messages `Resized`, `TitleChanged`, `Bell`.
+**Interfaces:** `TerminalView(*, send, resize_transport=None, scrollback=5000, theme=None, reserved_keys=frozenset(), terminal=None, close_terminal=False, queue_size=256)`; `.feed(bytes)`; `.sync_terminal_size() -> tuple[int, int]`; `.terminal`; messages `Resized`, `TitleChanged`, `Bell`.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the shared harness once**
+
+v1 of this plan drifted three incompatible `Harness` definitions across tasks. One definition, in its own module, used by every widget test:
 
 ```python
-# tests/test_widget_render.py
-import pytest
+# tests/widget_harness.py
+from __future__ import annotations
+
+import asyncio
 from textual.app import App, ComposeResult
+from textual.message import Message
+from ghostty_textual.emulator import Terminal
 from ghostty_textual.widget import TerminalView
 
 
 class Harness(App):
-    def __init__(self):
+    """One configurable app for every widget test."""
+
+    def __init__(
+        self,
+        *,
+        terminal: Terminal | None = None,
+        close_terminal: bool = False,
+        reserved_keys: frozenset[str] = frozenset(),
+        queue_size: int = 256,
+        stalled_send: bool = False,
+        resize_transport=None,
+    ) -> None:
         super().__init__()
         self.sent: list[bytes] = []
+        self.captured: list[Message] = []
         self.view: TerminalView | None = None
+        self._gate = asyncio.Event()
+        if not stalled_send:
+            self._gate.set()
+        self._options = dict(
+            terminal=terminal, close_terminal=close_terminal,
+            reserved_keys=reserved_keys, queue_size=queue_size,
+            resize_transport=resize_transport,
+        )
 
     def compose(self) -> ComposeResult:
-        self.view = TerminalView(send=self._send)
+        self.view = TerminalView(send=self._send, **self._options)
         yield self.view
 
     async def _send(self, data: bytes) -> None:
+        await self._gate.wait()
         self.sent.append(data)
+
+    def release_send(self) -> None:
+        self._gate.set()
+
+    def messages_of(self, kind: type[Message]) -> list[Message]:
+        return [m for m in self.captured if isinstance(m, kind)]
+
+    async def on_message(self, message: Message) -> None:
+        self.captured.append(message)
+```
+
+- [ ] **Step 2: Write the failing render tests**
+
+```python
+# tests/test_widget_render.py
+from ghostty_textual.emulator import Terminal
+from tests.widget_harness import Harness
 
 
 async def test_fed_text_appears_in_a_strip():
     app = Harness()
     async with app.run_test(size=(40, 10)):
         app.view.feed(b"hello")
-        await app.workers.wait_for_complete()
-        strip = app.view.render_line(0)
-        assert "hello" in strip.text
+        assert "hello" in app.view.render_line(0).text
 
 
 async def test_terminal_is_sized_to_the_content_area():
@@ -1216,40 +1324,18 @@ async def test_terminal_is_sized_to_the_content_area():
 async def test_resize_transport_is_called_synchronously_on_mount():
     """Spec v2 §6.3: SSH must start at the real size, not 80x24."""
     seen: list[tuple[int, int]] = []
-    app = Harness()
-    app.view_factory = lambda: TerminalView(send=app._send, resize_transport=lambda c, r: seen.append((c, r)))
+    app = Harness(resize_transport=lambda c, r: seen.append((c, r)))
     async with app.run_test(size=(40, 10)):
         assert seen and seen[0] == (40, 10)
 
 
-async def test_title_change_posts_a_message():
+async def test_sgr_colour_reaches_the_strip():
     app = Harness()
     async with app.run_test(size=(40, 10)):
-        app.view.feed(b"\x1b]0;remote\x07")
-        await app.workers.wait_for_complete()
-        assert app.view.terminal.title == "remote"
-```
+        app.view.feed(b"\x1b[31mred\x1b[0m")
+        assert any(s.style and s.style.color for s in app.view.render_line(0))
 
-- [ ] **Step 2: Run to verify they fail**
 
-Run: `uv run pytest tests/test_widget_render.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'ghostty_textual.widget'`
-
-- [ ] **Step 3: Implement rendering and sizing**
-
-- Shadow buffer is `list[list[Cell]]` for the viewport. Applying a `Frame`: if `full_redraw`, replace wholesale; otherwise apply `row_patches` by index.
-- **Guard on `frame.generation`.** If it differs from the shadow buffer's generation, discard patches and request `snapshot(force=True)` — this is the intern-rollover contract from Task 1.
-- `render_line(y)` reads only the shadow buffer. Group runs by `style_id`, skip `width == 0` continuation cells, end with `.apply_offsets(0, y)`.
-- Size from `content_size`, not `size`, so theme borders do not desync the transport. Call `resize_transport` **synchronously** in `on_mount`/`on_resize`, then post `Resized`. Coalesce duplicates; reject zero dimensions.
-
-- [ ] **Step 4: Run to verify they pass**
-
-Run: `uv run pytest tests/test_widget_render.py -v`
-Expected: 4 passed
-
-- [ ] **Step 5: Add ownership and style-rendering tests**
-
-```python
 async def test_widget_closes_the_terminal_it_created():
     app = Harness()
     async with app.run_test(size=(40, 10)):
@@ -1258,7 +1344,6 @@ async def test_widget_closes_the_terminal_it_created():
 
 
 async def test_an_injected_terminal_is_borrowed_not_closed():
-    """Spec v2 §3.5: injected means borrowed unless ownership is transferred."""
     injected = Terminal(40, 10)
     app = Harness(terminal=injected)
     async with app.run_test(size=(40, 10)):
@@ -1267,7 +1352,7 @@ async def test_an_injected_terminal_is_borrowed_not_closed():
     injected.close()
 
 
-async def test_close_terminal_transfers_ownership_explicitly():
+async def test_close_terminal_transfers_ownership():
     injected = Terminal(40, 10)
     app = Harness(terminal=injected, close_terminal=True)
     async with app.run_test(size=(40, 10)):
@@ -1275,65 +1360,77 @@ async def test_close_terminal_transfers_ownership_explicitly():
     assert injected.closed
 
 
-async def test_sgr_colour_reaches_the_strip():
+async def test_generation_change_replaces_the_shadow_atomically():
     app = Harness()
     async with app.run_test(size=(40, 10)):
-        app.view.feed(b"\x1b[31mred\x1b[0m")
-        await app.workers.wait_for_complete()
-        segments = list(app.view.render_line(0))
-        assert any(seg.style and seg.style.color for seg in segments)
+        app.view.feed(b"hello")
+        first = app.view.render_line(0).text
+        app.view.terminal.hard_reset()
+        app.view.feed(b"world")
+        assert first != app.view.render_line(0).text
 ```
 
-Run: `uv run pytest tests/test_widget_render.py -v`
+- [ ] **Step 3: Run to verify they fail** — `uv run pytest tests/test_widget_render.py -v`
+
+- [ ] **Step 4: Implement rendering and sizing**
+
+- Shadow buffer holds `(generation, rows, styles, links)` **as one tuple**, replaced by a single assignment. Applying a `Frame`: if `frame.generation != shadow.generation` or `frame.full_redraw`, replace wholesale; otherwise apply `row_patches` by index. A generation mismatch on a patch-only frame means discard and `snapshot(force=True)`.
+- `render_line(y)` reads only the shadow buffer, resolving styles through the frame's own table. Group runs by `style_id`, skip `width == 0` cells, end with `.apply_offsets(0, y)`.
+- Size from `content_size`, not `size`. Call `resize_transport` **synchronously** in `on_mount`/`on_resize`, then post `Resized`. Coalesce duplicates; reject zero dimensions.
+
+- [ ] **Step 5: Run to verify they pass** — Expected: 8 passed
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-uv run ruff check src tests
-git add src/ghostty_textual/widget.py tests/test_widget_render.py
-git commit -m "feat: TerminalView rendering with shadow buffer and sizing contract"
+git add src/ghostty_textual/widget.py tests/widget_harness.py tests/test_widget_render.py
+git commit -m "feat: TerminalView rendering with self-contained frame application"
 ```
 
 ---
 
-### Task 9: Ordered output, failure containment, and reset
+### Task 10: Ordered output, failure containment, async reset
 
-**Files:**
-- Modify: `src/ghostty_textual/widget.py`
-- Test: `tests/test_widget_output.py`
+**Files:** Modify `src/ghostty_textual/widget.py`; Test `tests/test_widget_output.py`
 
-**Interfaces:**
-- Produces: `TerminalView.hard_reset()`; message `TerminalFailed(error)`; `.failed: bool`.
+**Interfaces:** **`async TerminalView.reset_io()`**; `TerminalView.hard_reset()` (sync, terminal-only); message `TerminalFailed(error)`; `.failed: bool`.
+
+**A synchronous reset cannot cancel an in-flight `await send(...)`.** v1 of this plan claimed it could. I/O reset is therefore `async` — it cancels the writer task, awaits its exit, drains the queue, and bumps the writer generation. `feed()` stays synchronous; only the reset is awaited.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_widget_output.py
+from ghostty_textual.widget import TerminalFailed
+from tests.widget_harness import Harness
+
+
 async def test_query_replies_and_keystrokes_share_one_fifo():
     """A DSR reply interleaved into a keystroke would corrupt the input stream."""
     app = Harness()
     async with app.run_test(size=(40, 10)) as pilot:
         app.view.feed(b"\x1b[6n")
         await pilot.press("a")
-        await app.workers.wait_for_complete()
-        assert app.sent == [b"\x1b[1;6R", b"a"] or app.sent == [b"\x1b[1;1R", b"a"]
+        await pilot.pause()
+        assert app.sent[-1] == b"a"
+        assert app.sent[0].endswith(b"R")
 
 
-async def test_a_full_queue_fails_fast_rather_than_dropping():
+async def test_a_full_queue_fails_fast():
     app = Harness(queue_size=1, stalled_send=True)
     async with app.run_test(size=(40, 10)):
-        for _ in range(50):
+        for _ in range(200):
             app.view.feed(b"\x1b[6n")
-        await app.workers.wait_for_complete()
         assert app.view.failed
+        assert app.messages_of(TerminalFailed)
 
 
 async def test_a_fatal_emulator_error_never_escapes_feed():
     """Escaping would reach SshSession._pump and recreate the ADR-0001 freeze."""
     app = Harness()
     async with app.run_test(size=(40, 10)):
-        app.view.terminal.close()          # force a lifecycle violation
-        app.view.feed(b"hello")            # must not raise
+        app.view.terminal.close()
+        app.view.feed(b"hello")          # must not raise
         assert app.view.failed
 
 
@@ -1346,12 +1443,23 @@ async def test_feeds_after_failure_are_ignored():
         assert app.view.failed
 
 
-async def test_hard_reset_discards_the_previous_sessions_writes():
+async def test_reset_io_discards_the_previous_sessions_writes():
     """Queued bytes must never reach a reconnected process."""
     app = Harness(stalled_send=True)
     async with app.run_test(size=(40, 10)):
         app.view.feed(b"\x1b[6n")
-        app.view.hard_reset()
+        await app.view.reset_io()
+        app.release_send()
+        await app.workers.wait_for_complete()
+        assert app.sent == []
+
+
+async def test_reset_io_cancels_an_in_flight_send():
+    app = Harness(stalled_send=True)
+    async with app.run_test(size=(40, 10)) as pilot:
+        await pilot.press("a")           # writer blocks inside send()
+        await pilot.pause()
+        await app.view.reset_io()        # must cancel and await, not race
         app.release_send()
         await app.workers.wait_for_complete()
         assert app.sent == []
@@ -1359,42 +1467,29 @@ async def test_hard_reset_discards_the_previous_sessions_writes():
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `uv run pytest tests/test_widget_output.py -v`
-Expected: FAIL
+- [ ] **Step 3: Implement**
 
-- [ ] **Step 3: Implement the ordered writer and failure containment**
+- One bounded `asyncio.Queue(queue_size)` plus a writer task. Sync path (`feed` → `pty_writes`) uses `put_nowait()`; `QueueFull` → `TerminalFailed`. Async paths (`on_key`, `on_paste`, focus) may `await put()`.
+- `feed()` wraps the emulator call in `try/except GhosttyError`, sets `_failed`, posts `TerminalFailed`, shuts the queue, and **returns normally**.
+- `async reset_io()`: bump writer generation → cancel the writer task → `await` it → drain the queue without sending → start a fresh writer → clear `_failed`. The generation check means a send that completes during cancellation is discarded rather than recorded.
+- `on_unmount` awaits `reset_io()` so a final chunk racing pane removal is dropped deterministically.
 
-- One bounded `asyncio.Queue` plus a writer task. Sync path (`feed` → `pty_writes`) uses `put_nowait()`; `QueueFull` → `TerminalFailed`. Async paths (`on_key`, `on_paste`, focus) may `await put()`.
-- `feed()` wraps the emulator call in `try/except GhosttyError`, sets `self._failed`, posts `TerminalFailed`, shuts the queue, and **returns normally**.
-- `hard_reset()` drains the queue without sending, bumps a writer generation so in-flight sends from the old generation are abandoned, clears `_failed`, resets the shadow buffer, and forces a full snapshot.
+- [ ] **Step 4: Run to verify they pass** — Expected: 6 passed
 
-- [ ] **Step 4: Run to verify they pass**
-
-Run: `uv run pytest tests/test_widget_output.py -v`
-Expected: 5 passed
-
-- [ ] **Step 5: Run the whole suite**
-
-Run: `uv run pytest -q`
-
-- [ ] **Step 6: Lint and commit**
+- [ ] **Step 5: Lint and commit**
 
 ```bash
-uv run ruff check src tests
 git add src/ghostty_textual/widget.py tests/test_widget_output.py
-git commit -m "feat: ordered write queue, failure containment, and reset discard"
+git commit -m "feat: ordered write queue, failure containment, async I/O reset"
 ```
 
 ---
 
-### Task 10: Selection, scroll gestures, and cursor
+### Task 11: Selection, scroll gestures, cursor
 
-**Files:**
-- Modify: `src/ghostty_textual/widget.py`
-- Test: `tests/test_widget_interaction.py`
+**Files:** Modify `src/ghostty_textual/widget.py`; Test `tests/test_widget_interaction.py`
 
-**Interfaces:**
-- Produces: `TerminalView.get_selection(selection) -> tuple[str, str] | None`; `MouseMode` enum with a single `LOCAL` member.
+**Interfaces:** `TerminalView.get_selection(selection) -> tuple[str, str] | None`; `MouseMode` enum with a single `LOCAL` member; `.cursor_visible`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1403,26 +1498,23 @@ async def test_selection_extracts_text_without_padding():
     app = Harness()
     async with app.run_test(size=(40, 10)):
         app.view.feed(b"hello")
-        await app.workers.wait_for_complete()
         text, _ = app.view.get_selection(Selection.from_offsets((0, 0), (5, 0)))
         assert text == "hello"
 
 
-async def test_selection_skips_wide_continuation_cells():
+async def test_selection_skips_spacer_tail_cells():
     app = Harness()
     async with app.run_test(size=(40, 10)):
         app.view.feed("界界".encode())
-        await app.workers.wait_for_complete()
         text, _ = app.view.get_selection(Selection.from_offsets((0, 0), (4, 0)))
         assert text == "界界"
 
 
-async def test_wheel_scrolls_local_history_and_sends_nothing():
+async def test_wheel_scrolls_locally_and_sends_nothing():
     """ADR-0002: the mouse belongs to the pane, never to the remote app."""
     app = Harness()
     async with app.run_test(size=(40, 5)) as pilot:
         app.view.feed(b"".join(b"line%d\r\n" % i for i in range(40)))
-        await app.workers.wait_for_complete()
         await pilot.hover(app.view)
         await pilot.mouse_scroll_up(app.view)
         assert app.sent == []
@@ -1447,79 +1539,69 @@ async def test_cursor_is_hidden_while_scrolled_away():
     async with app.run_test(size=(40, 5)):
         app.view.feed(b"".join(b"line%d\r\n" % i for i in range(40)))
         app.view.terminal.scroll_to_top()
-        await app.workers.wait_for_complete()
+        app.view.refresh_frame()
         assert not app.view.cursor_visible
-```
 
-- [ ] **Step 2: Run to verify they fail**
 
-Run: `uv run pytest tests/test_widget_interaction.py -v`
-
-- [ ] **Step 3: Implement**
-
-- `get_selection` reads the immutable shadow buffer, trims trailing padding, skips `width == 0` cells, joins hard breaks with `\n`.
-- Wheel and `Shift+PageUp/Down` call `terminal.scroll_viewport(...)` then request a frame. **Never** call `encode_mouse` from the widget.
-- Cursor from `CursorState`: block → reverse, underline → underline, bar → reverse (documented limitation). Blink timer off when unfocused; invalidate only the cursor row.
-- `reserved_keys` is checked **before** encoding and the event is left unstopped so priority bindings fire.
-
-- [ ] **Step 4: Run to verify they pass**
-
-Run: `uv run pytest tests/test_widget_interaction.py -v`
-Expected: 6 passed
-
-- [ ] **Step 5: Add the offsets regression test**
-
-```python
 async def test_render_line_applies_offsets():
     """Without this the compositor cannot map a click to a cell and selection
     silently yields nothing. ADR-0002 records the original bug."""
     app = Harness()
     async with app.run_test(size=(40, 10)):
         app.view.feed(b"hello")
-        await app.workers.wait_for_complete()
         assert app.view.render_line(0)._offsets is not None
 ```
 
-Run: `uv run pytest tests/test_widget_interaction.py -v`
+- [ ] **Step 2: Run to verify they fail**
 
-- [ ] **Step 6: Lint and commit**
+- [ ] **Step 3: Implement**
+
+- `get_selection` reads the immutable shadow, trims trailing padding, skips `width == 0`, joins hard breaks with `\n`.
+- Wheel and `Shift+PageUp/Down` call `terminal.scroll_viewport(...)` then request a frame. **Never** call `encode_mouse` from the widget.
+- Cursor from `CursorState`: `BLOCK` → reverse, `UNDERLINE` → underline, `BLOCK_HOLLOW` → reverse, `BAR` → reverse (documented limitation). Blink timer off when unfocused; invalidate only the cursor row.
+- `reserved_keys` checked **before** encoding; the event is left unstopped so priority bindings fire.
+
+- [ ] **Step 4: Run to verify they pass** — Expected: 7 passed
+
+- [ ] **Step 5: Lint and commit**
 
 ```bash
-uv run ruff check src tests
 git add src/ghostty_textual/widget.py tests/test_widget_interaction.py
 git commit -m "feat: selection, local scroll gestures, and cursor rendering"
 ```
 
 ---
 
-### Task 11: Hyperlinks, clipboard policy, and rate limiting
+### Task 12: Hyperlink and clipboard policy
 
-**Files:**
-- Modify: `src/ghostty_textual/widget.py`, `src/ghostty_textual/emulator.py`
-- Test: `tests/test_security.py`
+**Files:** Modify `widget.py`, `emulator.py`; Test `tests/test_security.py`
 
-**Interfaces:**
-- Produces: widget messages `LinkClicked(uri: str)` and `ClipboardWrite(text: str)`; emulator notification `ClipboardWritten(text: str)`; `Terminal.resolve_link(link_id) -> str | None`; `Terminal.kitty_image_storage_bytes -> int`.
+**Interfaces:** widget messages `LinkClicked(uri)`, `ClipboardWrite(text)`; emulator notification `ClipboardWritten(text)`; `Terminal.resolve_link(link_id) -> str | None`.
 
-**Naming, deliberately distinct:** `ClipboardWritten` is the *emulator* notification inside `TerminalEffects`; `ClipboardWrite` is the *Textual message* the widget posts after applying policy. Do not merge them — the emulator has no opinion about the UI, and the widget is where the policy decision is observable.
+**Naming, deliberately distinct:** `ClipboardWritten` is the *emulator* notification inside `TerminalEffects`; `ClipboardWrite` is the *Textual message* the widget posts after applying policy. The emulator has no opinion about the UI; the widget is where the policy decision becomes observable.
+
+Interning and generation semantics already exist from Task 1; this task adds only policy.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
+import base64
+from ghostty_textual.emulator import ClipboardPolicy, ClipboardWritten, ResourceLimits, Terminal
+
+
 async def test_clicking_a_link_posts_the_uri_and_opens_nothing():
     app = Harness()
     async with app.run_test(size=(40, 10)) as pilot:
         app.view.feed(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\")
-        await app.workers.wait_for_complete()
         await pilot.click(app.view, offset=(1, 0))
         assert app.messages_of(LinkClicked)[0].uri == "https://example.com"
 
 
-def test_oversized_link_uris_are_rejected():
-    with Terminal(80, 24, limits=ResourceLimits(max_link_uri_bytes=32)) as terminal:
+def test_oversized_link_uris_are_not_interned():
+    limits = ResourceLimits(max_link_uri_bytes=32)
+    with Terminal(80, 24, limits=limits) as terminal:
         terminal.feed(b"\x1b]8;;https://example.com/" + b"a" * 500 + b"\x1b\\x")
-        frame = terminal.snapshot(force=True)
-        assert frame.row_patches[0].cells[0].link_id is None
+        assert terminal.snapshot(force=True).row_patches[0].cells[0].link_id is None
 
 
 def test_clipboard_write_is_off_by_default():
@@ -1542,57 +1624,45 @@ def test_oversized_clipboard_payloads_are_dropped():
 
 
 def test_notification_floods_are_rate_limited():
-    with Terminal(80, 24, limits=ResourceLimits(notification_rate_per_sec=10)) as terminal:
-        effects = terminal.feed(b"\x07" * 1000)
-        assert len(effects.notifications) <= 10
+    limits = ResourceLimits(notification_rate_per_sec=10)
+    with Terminal(80, 24, limits=limits) as terminal:
+        assert len(terminal.feed(b"\x07" * 1000).notifications) <= 10
 
 
 def test_kitty_image_storage_is_disabled():
-    """Graphics are parsed but never retained in v1."""
     with Terminal(80, 24) as terminal:
         assert terminal.kitty_image_storage_bytes == 0
 ```
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `uv run pytest tests/test_security.py -v`
+- [ ] **Step 3: Implement** — link resolution via the grid-reference/hyperlink ABI; `LinkClicked` carries the URI and the library **never opens it**; scheme policy belongs to the application.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 4: Run to verify they pass** — Expected: 7 passed
 
-Set `GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT` to `0` and the `APC_MAX_BYTES` options from `ResourceLimits` at construction. Link interning is bounded exactly like style interning and shares the generation. `LinkClicked` carries the URI and the library never opens it — scheme policy is the application's.
-
-- [ ] **Step 4: Run to verify they pass**
-
-Run: `uv run pytest tests/test_security.py -v`
-Expected: 7 passed
-
-- [ ] **Step 5: Run the whole suite**
-
-Run: `uv run pytest -q`
+- [ ] **Step 5: Extend `REQUIRED_SYMBOLS`/`test_abi.py`** with the hyperlink/grid-ref symbols.
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-uv run ruff check src tests
 git add src/ghostty_textual/ tests/test_security.py
 git commit -m "feat: hyperlink handling, clipboard policy, and resource limits"
 ```
 
 ---
 
-### Task 12: Benchmarks, fuzzing, and packaging
+### Task 13: Benchmarks, fuzzing, packaging, CI
 
-**Files:**
-- Create: `benchmarks/frame_extraction.py`, `tests/test_fuzz.py`, `.github/workflows/ci.yml`
-- Test: `tests/test_packaging.py`
+**Files:** Create `benchmarks/frame_extraction.py`, `tests/test_fuzz.py`, `tests/test_performance.py`, `tests/test_packaging.py`, `.github/workflows/ci.yml`
 
 - [ ] **Step 1: Write the benchmark script**
 
 ```python
 # benchmarks/frame_extraction.py
-"""Measure frame extraction. Spec v2 §10: 120x40 full frame, p95 < 10 ms."""
+"""Spec v2 §10: 120x40 full frame, p95 < 10 ms. Reference measurement: ~4 ms."""
 import statistics, time
 from ghostty_textual.emulator import Terminal
+
 
 def main() -> None:
     with Terminal(120, 40, scrollback=5000) as terminal:
@@ -1609,8 +1679,9 @@ def main() -> None:
             single.append((time.perf_counter() - start) * 1000)
     for name, samples in (("full 120x40", full), ("single dirty row", single)):
         ordered = sorted(samples)
-        p95 = ordered[int(len(ordered) * 0.95)]
-        print(f"{name}: median {statistics.median(samples):.3f} ms  p95 {p95:.3f} ms")
+        print(f"{name}: median {statistics.median(samples):.3f} ms  "
+              f"p95 {ordered[int(len(ordered) * 0.95)]:.3f} ms")
+
 
 if __name__ == "__main__":
     main()
@@ -1619,15 +1690,12 @@ if __name__ == "__main__":
 - [ ] **Step 2: Run it and record the baseline**
 
 Run: `uv run python benchmarks/frame_extraction.py`
-Expected: full-frame p95 under 10 ms. If it is not, stop and profile before continuing — the dirty-row design exists to make this cheap, and missing the budget means something is re-reading clean rows.
+Expected: full-frame p95 under 10 ms (reference ≈4 ms). If it is not, profile before continuing — do **not** reach for a private packed-layout fast path until the public path is proven insufficient, and if you do, keep it optional and differential-tested against the public path.
 
-- [ ] **Step 3: Add the budget as a test**
+- [ ] **Step 3: Add the budget and fuzz tests**
 
 ```python
 # tests/test_performance.py
-import time, pytest
-from ghostty_textual.emulator import Terminal
-
 @pytest.mark.performance
 def test_full_frame_extraction_within_budget():
     with Terminal(120, 40, scrollback=5000) as terminal:
@@ -1641,22 +1709,18 @@ def test_full_frame_extraction_within_budget():
     assert p95 < 10.0, f"p95 {p95:.2f} ms exceeds the 10 ms budget"
 ```
 
-- [ ] **Step 4: Add subprocess fuzzing**
-
 ```python
 # tests/test_fuzz.py
-import random, subprocess, sys, pytest
-
 RUNNER = """
 import sys, random
 from ghostty_textual.emulator import Terminal
-seed = int(sys.argv[1])
-rng = random.Random(seed)
+rng = random.Random(int(sys.argv[1]))
 with Terminal(80, 24) as terminal:
     for _ in range(500):
         terminal.feed(bytes(rng.randrange(256) for _ in range(rng.randrange(1, 64))))
         terminal.snapshot()
 """
+
 
 @pytest.mark.parametrize("seed", range(8))
 def test_random_bytes_never_crash_or_hang(seed: int) -> None:
@@ -1667,16 +1731,48 @@ def test_random_bytes_never_crash_or_hang(seed: int) -> None:
     assert result.returncode == 0, result.stderr.decode()[-2000:]
 ```
 
-Run: `uv run pytest tests/test_fuzz.py -v`
-Expected: 8 passed
+- [ ] **Step 4: Write a real packaging test**
 
-- [ ] **Step 5: Add packaging tests and CI**
+Re-importing the source tree proves nothing about the wheel. Build it, install it into a clean throwaway environment, and check the artefact:
 
 ```python
 # tests/test_packaging.py
-def test_package_imports_without_loading_native_code():
+import subprocess, sys, sysconfig, zipfile
+from pathlib import Path
+import pytest
+
+CHECK = (
+    "import ghostty_textual as g;"
+    "assert g.__version__;"
+    "assert {'GhosttyError', 'GhosttyUnavailable'} <= set(g.__all__);"
+    "from ghostty_textual.emulator import Terminal;"
+    "t = Terminal(20, 3); t.feed(b'hi'); assert t.snapshot(force=True); t.close();"
+    "print('ok')"
+)
+
+
+@pytest.mark.packaging
+def test_wheel_installs_and_works_in_a_clean_environment(tmp_path: Path) -> None:
+    subprocess.run([sys.executable, "-m", "build", "--wheel", "-o", str(tmp_path)],
+                   check=True, capture_output=True)
+    wheel = next(tmp_path.glob("*.whl"))
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+    assert any(n.endswith("ghostty_textual/py.typed") for n in names), "py.typed not shipped"
+    assert any("licenses/" in n or n.endswith("LICENSE") for n in names), "licence not shipped"
+
+    env = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(env)], check=True)
+    python = env / ("Scripts" if sysconfig.get_platform().startswith("win") else "bin") / "python"
+    subprocess.run([str(python), "-m", "pip", "install", "-q", str(wheel)], check=True)
+    result = subprocess.run([str(python), "-c", CHECK], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
+def test_package_imports_without_loading_native_code() -> None:
     """Spec v2 §7: importable on platforms with no wheel."""
-    import subprocess, sys
     result = subprocess.run(
         [sys.executable, "-c", "import ghostty_textual; print(ghostty_textual.__version__)"],
         capture_output=True,
@@ -1684,25 +1780,73 @@ def test_package_imports_without_loading_native_code():
     assert result.returncode == 0
 ```
 
-CI matrix: `macos-14` (arm64), `macos-13` (x86_64), `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` (aarch64). Each job runs `uv sync --all-extras`, `uv run ruff check src tests`, `uv run pytest -q`. Add a **separate scheduled job** that installs the latest `pyghostty` instead of the pin and runs `tests/test_abi.py`, so upstream ABI drift surfaces as a failing nightly rather than a broken release.
+Add a `LICENSE` file and confirm `py.typed` is included by `[tool.hatch.build.targets.wheel]`.
+
+- [ ] **Step 5: Write CI**
+
+Matrix over the four wheel platforms. **Confirm current runner labels against
+<https://github.com/actions/runner-images> when you write this** — `macos-13` is
+retired; use the current ARM and Intel macOS labels (at time of writing,
+`macos-15` and `macos-15-intel`) plus `ubuntu-24.04` and `ubuntu-24.04-arm`.
+
+Each job: `uv sync --all-extras`, `uv run ruff check src tests benchmarks`, `uv run pytest -q`.
+
+The scheduled ABI-drift job must **not** let `uv run` re-sync back to the pin:
+
+```yaml
+  abi-drift:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras
+      - run: uv pip install --upgrade pyghostty        # deliberately off-lockfile
+      - run: uv run --no-sync pytest tests/test_abi.py -v   # --no-sync preserves it
+```
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
 uv run ruff check src tests benchmarks
-git add benchmarks tests/test_fuzz.py tests/test_performance.py tests/test_packaging.py .github
-git commit -m "feat: performance budget, subprocess fuzzing, and CI matrix"
+git add benchmarks tests/test_fuzz.py tests/test_performance.py tests/test_packaging.py .github LICENSE
+git commit -m "feat: performance budget, subprocess fuzzing, wheel packaging test, CI"
 ```
 
 ---
 
 ## Definition of done
 
-- [ ] `uv run pytest -q` green; `uv run ruff check src tests` clean
+- [ ] `uv run pytest -q` green; `uv run ruff check src tests benchmarks` clean
 - [ ] `emulator.py`, `cells.py`, `theme.py`, `keys.py` import no Textual; `widget.py` imports no `pyghostty`/`cffi`
+- [ ] No code decodes a `GhosttyCell`/`GhosttyRow` bit layout
+- [ ] `REQUIRED_SYMBOLS` covers every symbol the library calls, asserted in `test_abi.py`
 - [ ] Frame extraction p95 under 10 ms at 120×40
 - [ ] Fuzz runs clean in subprocesses
-- [ ] CI green on all four wheel platforms
-- [ ] Scheduled unpinned-ABI job exists and passes
+- [ ] Wheel installs into a clean environment, exports its public API, ships `py.typed` and a licence
+- [ ] CI green on all four wheel platforms; scheduled ABI-drift job exists and does not re-sync the pin
 
-Once green, write the `pysshmanager` cutover plan (spec §8 and §13), which is scoped separately and includes the ~1 day test rewrite.
+Then write the `pysshmanager` cutover plan (spec §8 and §13), including the ~1 day test rewrite.
+
+## Review disposition
+
+| Finding | Disposition |
+|---|---|
+| **Task 2 raw-cell premise is wrong** | **Accepted — verified.** `GhosttyCell`/`GhosttyRow` are opaque `uint64_t` with `ghostty_cell_get`; `GhosttyCellWide` supplies SPACER_TAIL/HEAD; `HAS_STYLING`/`STYLE_ID`/`HAS_HYPERLINK` answer the rest. The spike is deleted. The v1 `raw >> 2` observation came from reading a `uint64_t` handle through a `uint32_t*` — an accidental correlation with private packing |
+| `GRAPHEMES_UTF8` rc=-3 means buffer too small | Accepted; grapheme text is read via the render-state grapheme buffer API |
+| Interner rollover cannot work as sequenced | Accepted — `InternerFull` raised **before** insertion; `snapshot()` catches, rolls over, discards the partial extraction, restarts forced (Task 1, Task 4) |
+| `resolve()` accepts negative ids | Accepted (Task 1) |
+| Frames carry `style_id` with no table | Accepted — self-contained frames carry complete generation-scoped `styles` and `links` tables (Task 4) |
+| Hyperlinks arrive too late | Accepted — `LinkInterner` moves to Task 1; Task 12 keeps only policy |
+| Unsafe FFI output types | Accepted — typed getters in `_native.py`; enums read int-sized; cursor coordinates gated on `HAS_VALUE`; global dirty cleared via `render_state_set(OPTION_DIRTY)` (Tasks 1, 2) |
+| `REQUIRED_SYMBOLS` must grow per task | Accepted — now a global constraint with a step in every task that adds native calls |
+| Sync `hard_reset()` cannot cancel an in-flight send | Accepted — `async reset_io()` cancels and awaits the writer; `feed()` stays sync (Task 10) |
+| `ViewportState.offset` needs the scrollbar struct | Accepted — `GhosttyTerminalScrollbar {total, offset, len}`, verified present (Task 2) |
+| `ViewportState` used before it is defined | Accepted — moved to Task 2 |
+| `encode_paste` return type | Accepted — `bytes \| None` (Task 8) |
+| F25 is a valid Ghostty key | Accepted — test uses a synthetic unknown name |
+| Task 8 harness is inconsistent | Accepted — one `tests/widget_harness.py`, written before its first use (Task 9) |
+| `TerminalModes`/synchronized output had no task | Accepted — new Task 6, measurement-first per spec §3.1 |
+| `ResourceLimits` needs APC fields | Accepted — declared in Task 3 |
+| Packaging test too weak | Accepted — builds a wheel, installs into a clean venv, checks exports, `py.typed`, licence (Task 13) |
+| Scheduled job re-syncs the pin | Accepted — `uv run --no-sync` |
+| `macos-13` is retired | Accepted — current labels, with an instruction to confirm against the runner-images table at write time |

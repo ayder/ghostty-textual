@@ -8,6 +8,7 @@ inherit the dead session's palette.
 from __future__ import annotations
 
 from ghostty_textual._native import Native
+from ghostty_textual.emulator import Terminal
 from tests.conftest import Harness, make_terminal
 
 
@@ -79,24 +80,22 @@ class TestPreservedByReset:
 
 
 class TestHardResetContract:
-    def test_recreation_clears_everything_the_c_reset_does_not(self, native: Native) -> None:
-        """`hard_reset()` is free-and-recreate; this is the behaviour it must produce."""
-        first = make_terminal(native, rows=5, scrollback=1000)
-        try:
-            _populate(first)
-            first.feed(b"\x1b]10;#ff0000\x07")
-            assert first.get_u32("COLOR_FOREGROUND") == 0x0000FF
-        finally:
-            first.close()
+    def test_recreation_clears_everything_the_c_reset_does_not(self) -> None:
+        """Exercise the public operation whose free-and-recreate contract matters."""
+        with Terminal(20, 5, scrollback=1000) as terminal:
+            default_foreground = terminal.colour_override_foreground
+            terminal.feed(b"\x1b]0;my-title\x07")
+            terminal.feed(b"".join(b"line%d\r\n" % i for i in range(40)))
+            terminal.feed(b"\x1b[?1049h")
+            terminal.feed(b"\x1b]10;#ff0000\x07")
+            assert terminal.colour_override_foreground == (255, 0, 0)
 
-        second = make_terminal(native, rows=5, scrollback=1000)
-        try:
-            assert second.get_str("TITLE") == b""
-            assert second.get_u32("SCROLLBACK_ROWS") == 0
-            assert second.get_u32("ACTIVE_SCREEN") == 0
-            assert second.get_u32("COLOR_FOREGROUND") is None
-        finally:
-            second.close()
+            terminal.hard_reset()
+
+            assert terminal.title in (None, "")
+            assert terminal.viewport.scrollback_rows == 0
+            assert not terminal.modes.alt_screen
+            assert terminal.colour_override_foreground == default_foreground
 
     def test_selection_is_absent_on_a_fresh_terminal(self, native: Native) -> None:
         """Documentation value only -- recreation makes the question moot."""

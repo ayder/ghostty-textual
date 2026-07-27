@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+      - run: uv run ruff check src tests benchmarks
+      - run: uv run pytest -q
+      - run: uv build
+
+  abi-drift:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras
+      - run: uv pip install --upgrade pyghostty
+      - run: uv run --no-sync pytest tests/test_abi.py -v

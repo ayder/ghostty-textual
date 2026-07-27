@@ -6,6 +6,10 @@ them fail after a dependency bump, the bump is not safe -- that is the point.
 
 from __future__ import annotations
 
+import builtins
+import re
+from pathlib import Path
+
 import pytest
 
 from ghostty_textual._native import (
@@ -14,6 +18,8 @@ from ghostty_textual._native import (
     SUPPORTED_WHEELS,
     GhosttyUnavailable,
     Native,
+    _verify_layouts,
+    _verify_symbols,
     load,
 )
 
@@ -25,6 +31,17 @@ def test_load_is_cached() -> None:
 def test_all_required_symbols_present(native: Native) -> None:
     missing = [name for name in REQUIRED_SYMBOLS if not hasattr(native.lib, name)]
     assert missing == []
+
+
+def test_every_native_call_site_is_declared_required() -> None:
+    """A new call must extend startup verification in the same change."""
+    source_root = Path(__file__).parents[1] / "src" / "ghostty_textual"
+    called: set[str] = set()
+    for name in ("_native.py", "_render.py", "emulator.py"):
+        source = (source_root / name).read_text()
+        called.update(re.findall(r"\bghostty_[a-z0-9_]+", source))
+    called.discard("ghostty_textual")
+    assert called <= set(REQUIRED_SYMBOLS), sorted(called - set(REQUIRED_SYMBOLS))
 
 
 @pytest.mark.parametrize(("twin", "real"), _TWIN_PAIRS)
@@ -80,3 +97,37 @@ def test_supported_wheel_tags_are_complete() -> None:
         "manylinux_2_27_aarch64.manylinux_2_28_aarch64",
         "manylinux_2_27_x86_64.manylinux_2_28_x86_64",
     )
+
+
+def test_missing_native_library_reports_supported_platforms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_import = builtins.__import__
+
+    def unavailable(name, *args, **kwargs):
+        if name == "pyghostty._ffi":
+            raise ImportError("simulated unsupported platform")
+        return real_import(name, *args, **kwargs)
+
+    load.cache_clear()
+    monkeypatch.setattr(builtins, "__import__", unavailable)
+    with pytest.raises(GhosttyUnavailable, match="Prebuilt wheels exist for"):
+        load()
+    load.cache_clear()
+
+
+def test_corrupt_library_and_layout_fail_at_the_native_boundary() -> None:
+    with pytest.raises(GhosttyUnavailable, match="missing symbols"):
+        _verify_symbols(object())
+
+    class MismatchedFfi:
+        @staticmethod
+        def sizeof(name: str) -> int:
+            return 24 if name.endswith("S") else 16
+
+        @staticmethod
+        def alignof(name: str) -> int:
+            return 8
+
+    with pytest.raises(GhosttyUnavailable, match="does not match"):
+        _verify_layouts(MismatchedFfi())

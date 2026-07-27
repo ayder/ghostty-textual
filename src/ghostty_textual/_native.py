@@ -51,26 +51,57 @@ REQUIRED_SYMBOLS = (
     "ghostty_terminal_get",
     "ghostty_terminal_vt_write",
     "ghostty_terminal_scroll_viewport",
+    "ghostty_terminal_grid_ref",
     # render state
     "ghostty_render_state_new",
     "ghostty_render_state_free",
     "ghostty_render_state_update",
     "ghostty_render_state_begin_update",
     "ghostty_render_state_end_update",
+    "ghostty_render_state_get",
+    "ghostty_render_state_set",
+    "ghostty_render_state_colors_get",
     "ghostty_render_state_row_iterator_new",
     "ghostty_render_state_row_iterator_next",
     "ghostty_render_state_row_iterator_free",
+    "ghostty_render_state_row_get",
+    "ghostty_render_state_row_set",
     "ghostty_render_state_row_cells_new",
     "ghostty_render_state_row_cells_next",
+    "ghostty_render_state_row_cells_select",
+    "ghostty_render_state_row_cells_get",
+    "ghostty_render_state_row_cells_get_multi",
     "ghostty_render_state_row_cells_free",
+    "ghostty_cell_get",
+    "ghostty_cell_get_multi",
+    "ghostty_row_get",
+    "ghostty_terminal_mode_get",
     # encoders
     "ghostty_key_encoder_new",
     "ghostty_key_encoder_free",
     "ghostty_key_encoder_encode",
     "ghostty_key_encoder_setopt_from_terminal",
+    "ghostty_key_event_new",
+    "ghostty_key_event_free",
+    "ghostty_key_event_set_action",
+    "ghostty_key_event_set_key",
+    "ghostty_key_event_set_mods",
+    "ghostty_key_event_set_utf8",
     "ghostty_focus_encode",
     "ghostty_paste_is_safe",
     "ghostty_paste_encode",
+    "ghostty_mouse_event_new",
+    "ghostty_mouse_event_free",
+    "ghostty_mouse_event_set_action",
+    "ghostty_mouse_event_set_button",
+    "ghostty_mouse_event_clear_button",
+    "ghostty_mouse_event_set_mods",
+    "ghostty_mouse_event_set_position",
+    "ghostty_mouse_encoder_new",
+    "ghostty_mouse_encoder_free",
+    "ghostty_mouse_encoder_setopt_from_terminal",
+    "ghostty_mouse_encoder_encode",
+    "ghostty_grid_ref_hyperlink_uri",
 )
 
 # ABI-mode cffi cannot pass unions by value. pyghostty ships a layout-identical
@@ -91,6 +122,7 @@ typedef struct {
 """
 
 _SCROLL_VIEWPORT_SIG = "void(*)(GhosttyTerminal, GhosttyTerminalScrollViewportS)"
+_GRID_REF_SIG = "GhosttyResult(*)(GhosttyTerminal, GhosttyPointS, GhosttyGridRef*)"
 
 #: (twin, real) pairs whose size and alignment must match exactly.
 _TWIN_PAIRS = (
@@ -111,6 +143,38 @@ class Native:
         if result:
             raise GhosttyError(f"{what} failed: {result}")
 
+    def get_bool(self, getter: Any, handle: Any, key: int, what: str) -> bool:
+        out = self.ffi.new("bool*")
+        self.check(getter(handle, key, out), what)
+        return bool(out[0])
+
+    def get_enum(self, getter: Any, handle: Any, key: int, what: str) -> int:
+        out = self.ffi.new("int*")
+        self.check(getter(handle, key, out), what)
+        return int(out[0])
+
+    def get_u16(self, getter: Any, handle: Any, key: int, what: str) -> int:
+        out = self.ffi.new("uint16_t*")
+        self.check(getter(handle, key, out), what)
+        return int(out[0])
+
+    def get_u32(self, getter: Any, handle: Any, key: int, what: str) -> int:
+        out = self.ffi.new("uint32_t*")
+        self.check(getter(handle, key, out), what)
+        return int(out[0])
+
+    def get_u64(self, getter: Any, handle: Any, key: int, what: str) -> int:
+        out = self.ffi.new("uint64_t*")
+        self.check(getter(handle, key, out), what)
+        return int(out[0])
+
+    def get_struct(self, getter: Any, handle: Any, key: int, ctype: str, what: str) -> Any:
+        out = self.ffi.new(f"{ctype}*")
+        if hasattr(out[0], "size"):
+            out[0].size = self.ffi.sizeof(ctype)
+        self.check(getter(handle, key, out), what)
+        return out[0]
+
     def scroll_viewport(self, terminal: Any, tag: int, value: int = 0) -> None:
         """Call `ghostty_terminal_scroll_viewport` through the struct twin."""
         fn = self._union_fn("ghostty_terminal_scroll_viewport", _SCROLL_VIEWPORT_SIG)
@@ -119,6 +183,18 @@ class Native:
         behavior.value.a = value & 0xFFFFFFFFFFFFFFFF
         behavior.value.b = 0
         fn(terminal, behavior[0])
+
+    def grid_ref(self, terminal: Any, x: int, y: int) -> Any:
+        """Return a viewport grid reference through pyghostty's point twin."""
+        fn = self._union_fn("ghostty_terminal_grid_ref", _GRID_REF_SIG)
+        point = self.ffi.new("GhosttyPointS*")
+        point.tag = self.lib.GHOSTTY_POINT_TAG_VIEWPORT
+        point.value.x = x
+        point.value.y = y
+        out = self.ffi.new("GhosttyGridRef*")
+        out.size = self.ffi.sizeof("GhosttyGridRef")
+        self.check(fn(terminal, point[0], out), "terminal_grid_ref")
+        return out
 
     def _union_fn(self, name: str, sig: str) -> Any:
         from pyghostty._ffi import union_fn

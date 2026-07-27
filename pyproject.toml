@@ -30,6 +30,10 @@ packages = ["src/ghostty_textual"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+markers = [
+  "performance: native extraction performance budgets",
+  "packaging: builds and installs distribution artifacts",
+]
 
 [tool.ruff]
 line-length = 100
@@ -37,3 +41,8 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[dependency-groups]
+dev = [
+    "hatchling>=1.31.0",
+]

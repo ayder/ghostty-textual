@@ -104,7 +104,8 @@ def make_terminal(
         harness._keepalive.append(on_write_pty)
         native.check(
             lib.ghostty_terminal_set(
-                harness.terminal, lib.GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+                harness.terminal,
+                lib.GHOSTTY_TERMINAL_OPT_WRITE_PTY,
                 ffi.cast("void*", on_write_pty),
             ),
             "set WRITE_PTY",

@@ -4,8 +4,10 @@ A [Textual](https://textual.textualize.io/) terminal widget backed by
 [libghostty-vt](https://libghostty.tip.ghostty.org/), Ghostty's embeddable
 terminal emulation core.
 
-**Status: pre-implementation.** The design is settled and the native boundary is
-verified by tests; the emulator and widget are not written yet.
+The headless emulator and `TerminalView` widget are implemented. The public
+renderer uses libghostty's render-state and cell accessor APIs, keeps Ghostty's
+viewport authoritative, and routes terminal replies and user input through one
+ordered transport queue.
 
 ## Why
 
@@ -30,8 +32,25 @@ Two layers, one native boundary:
 | Module | Role |
 |---|---|
 | `_native.py` | Loader, ABI verification, union-by-value shims. The only file that knows `pyghostty` exists. |
+| `_render.py` | Private public-ABI render-state extraction and dirty acknowledgement. |
 | `emulator.py` | `Terminal` — headless, no Textual import. Absorbs libghostty API churn. |
 | `widget.py` | `TerminalView` — rendering, input, selection. No C knowledge. |
+
+## Minimal use
+
+```python
+from ghostty_textual import TerminalView
+
+view = TerminalView(
+    send=session.send,
+    resize_transport=lambda cols, rows: session.resize(rows, cols),
+)
+session.on_output = view.feed
+```
+
+The application remains responsible for process and PTY lifecycle. For
+reconnects, close the old process, `await view.reset_io()`, call
+`view.hard_reset()`, then start the replacement process.
 
 ## Design documents
 

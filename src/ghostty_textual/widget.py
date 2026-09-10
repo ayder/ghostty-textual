@@ -596,27 +596,33 @@ class TerminalView(Widget):
         self._queue.put_nowait(data)
 
     async def _enqueue(self, data: bytes) -> None:
+        """Queue input for this session; discard waits interrupted by a reset.
+
+        Cancellation retracts a put still waiting for space. Bytes already
+        accepted by the queue belong to the writer and cannot be recalled.
+        """
         if self.failed or self._queue is None or self._queue_shutdown is None:
             raise GhosttyError("input before mount is not accepted")
         queue = self._queue
         shutdown = self._queue_shutdown
+        generation = self._writer_generation
         put_task = asyncio.create_task(queue.put(data))
         shutdown_task = asyncio.create_task(shutdown.wait())
-        done, _pending = await asyncio.wait(
-            (put_task, shutdown_task), return_when=asyncio.FIRST_COMPLETED
-        )
-        if shutdown_task in done:
-            put_task.cancel()
-            try:
-                await put_task
-            except asyncio.CancelledError:
-                pass
-            raise GhosttyError("writer queue is shut down")
-        shutdown_task.cancel()
         try:
-            await shutdown_task
-        except asyncio.CancelledError:
-            pass
+            await asyncio.wait(
+                (put_task, shutdown_task), return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            put_task.cancel()
+            shutdown_task.cancel()
+            await asyncio.gather(put_task, shutdown_task, return_exceptions=True)
+        # Cleanup yields too: check the generation only after both helpers have
+        # finished, so an old handler cannot fail a replacement writer.
+        if generation != self._writer_generation:
+            return
+        if shutdown.is_set():
+            raise GhosttyError("writer queue is shut down")
+        put_task.result()
 
     def _fail(self, error: GhosttyError) -> None:
         if self.failed:

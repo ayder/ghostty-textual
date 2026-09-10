@@ -106,7 +106,7 @@ REQUIRED_SYMBOLS = (
 
 # ABI-mode cffi cannot pass unions by value. pyghostty ships a layout-identical
 # struct twin for GhosttyPoint and notes that GhosttyTerminalScrollViewport
-# needs the same treatment "later"; as of pyghostty 0.1.0 that twin does not
+# needs the same treatment "later"; as of pyghostty 0.1.1 that twin does not
 # exist, so we carry it.
 #
 # The union is {intptr_t delta | size_t row | uint64_t _padding[2]} = 16 bytes,

@@ -1,6 +1,6 @@
 [project]
 name = "ghostty-textual"
-version = "0.0.1"
+version = "0.0.2"
 description = "Textual terminal widget backed by libghostty-vt"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -9,7 +9,7 @@ dependencies = [
   "textual>=8.2.8,<9",
   # Pinned exactly: ghostty-textual binds pyghostty's PRIVATE _ffi/_cdef
   # modules, which may change without deprecation. See spec v2 §7.
-  "pyghostty==0.1.0",
+  "pyghostty==0.1.1",
 ]
 
 [project.optional-dependencies]

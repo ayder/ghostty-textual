@@ -1,6 +1,6 @@
 """ABI verification: required symbols, union twins, and twin invocation.
 
-Spec v2 §2, §7. These guard the pinned `pyghostty==0.1.0` private ABI. If any of
+Spec v2 §2, §7. These guard the pinned `pyghostty==0.1.1` private ABI. If any of
 them fail after a dependency bump, the bump is not safe -- that is the point.
 """
 

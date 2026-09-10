@@ -61,6 +61,23 @@ reconnects, close the old process, `await view.reset_io()`, call
 - [`docs/superpowers/specs/2026-07-25-ghostty-textual-design.md`](docs/superpowers/specs/2026-07-25-ghostty-textual-design.md)
   — superseded v1
 
+## Supported platforms
+
+Requires Python 3.12+ and pins `pyghostty==0.1.1`, which bundles libghostty-vt
+built for baseline CPUs. No native compilation is needed to install it.
+
+| OS | Architectures | Minimum OS / libc |
+|---|---|---|
+| Linux | `amd64` / `x86_64`, `aarch64` / `arm64` | glibc 2.27 |
+| macOS | `amd64` / `x86_64` (Intel), `arm64` / `aarch64` (Apple Silicon) | macOS 13 |
+
+`amd64` and `x86_64` name the same architecture; so do `aarch64` and `arm64`.
+Use a 64-bit OS and Python on ARM devices such as Raspberry Pi 5. Upstream
+does not publish Windows, musl/Alpine Linux, or 32-bit ARM wheels.
+
+CI runs the native ABI and functional tests, plus a clean wheel installation
+and terminal smoke test, on Linux and macOS with both CPU architectures.
+
 ## Develop
 
 ```bash
@@ -68,9 +85,6 @@ uv sync --all-extras
 uv run pytest
 uv run ruff check src tests
 ```
-
-Requires a platform with a `pyghostty` wheel: macOS arm64/x86_64, or glibc Linux
-aarch64/x86_64.
 
 ## Licence
 

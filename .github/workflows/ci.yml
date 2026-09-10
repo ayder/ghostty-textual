@@ -8,22 +8,64 @@ on:
 
 jobs:
   test:
+    name: Test ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
-        runner:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
-          - macos-15
-          - macos-15-intel
+        include:
+          - platform: Linux amd64 (x86_64)
+            runner: ubuntu-24.04
+            machine: x86_64
+          - platform: Linux arm64 (aarch64)
+            runner: ubuntu-24.04-arm
+            machine: aarch64
+          - platform: macOS arm64
+            runner: macos-15
+            machine: arm64
+          - platform: macOS amd64 (x86_64)
+            runner: macos-15-intel
+            machine: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --all-extras
-      - run: uv run ruff check src tests benchmarks
-      - run: uv run pytest -q
+      - run: uv sync --locked --all-extras
+      - name: Verify native architecture
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os
+          import platform
+          assert platform.machine() == os.environ["EXPECTED_MACHINE"], platform.machine()
+          PY
+      - run: uv run --no-sync ruff check src tests benchmarks
+      - run: uv run --no-sync pytest -q
       - run: uv build
+      - name: Install and exercise the wheel in a clean environment
+        shell: bash
+        run: |
+          uv venv "$RUNNER_TEMP/wheel-smoke" --python .venv/bin/python
+          uv pip install --python "$RUNNER_TEMP/wheel-smoke/bin/python" dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-smoke/bin/python" - <<'PY'
+          import sys
+          from importlib.metadata import version
+
+          from ghostty_textual import Terminal, TerminalView
+
+          assert version("pyghostty") == "0.1.1"
+          assert "pyghostty._ffi" not in sys.modules
+          with Terminal(20, 3, scrollback=100) as terminal:
+              terminal.feed(b"hello")
+              frame = terminal.snapshot()
+              assert "".join(cell.text for cell in frame.row_patches[0].cells).startswith("hello")
+              terminal.feed(b"\r\nline" * 20)
+              terminal.scroll_to_top()
+              assert not terminal.viewport.at_bottom
+              terminal.scroll_to_bottom()
+              assert terminal.viewport.at_bottom
+          PY
 
   abi-drift:
     if: github.event_name == 'schedule'
@@ -31,6 +73,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --all-extras
+      - run: uv sync --locked --all-extras
       - run: uv pip install --upgrade pyghostty
       - run: uv run --no-sync pytest tests/test_abi.py -v

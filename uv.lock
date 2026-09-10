@@ -98,7 +98,7 @@ wheels = [
 
 [[package]]
 name = "ghostty-textual"
-version = "0.0.1"
+version = "0.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "pyghostty" },
@@ -119,7 +119,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "pyghostty", specifier = "==0.1.0" },
+    { name = "pyghostty", specifier = "==0.1.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
@@ -251,16 +251,16 @@ wheels = [
 
 [[package]]
 name = "pyghostty"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cffi" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5b/9e/64b07389d5a99d3c735f02629c561729f7df5a6ec4c7a8d1a9b6df6feef4/pyghostty-0.1.0-py3-none-macosx_13_0_arm64.whl", hash = "sha256:5b9dd0487667be3500e51ffbf5ca87f53e020a9ef36f0dc0cf4ddd277e8822b2", size = 591183, upload-time = "2026-07-24T07:20:25.047Z" },
-    { url = "https://files.pythonhosted.org/packages/66/82/b8531f50f44e8fa85cd96acd011067f55c932f4225891d34bb3e5def9b4f/pyghostty-0.1.0-py3-none-macosx_13_0_x86_64.whl", hash = "sha256:2722590d17f4cb5376e1d04d251a824b173223bb45466e94632c61b4e1cef577", size = 655962, upload-time = "2026-07-24T07:20:27.006Z" },
-    { url = "https://files.pythonhosted.org/packages/1f/e1/c2815400bb74a9846b44f2aa86e83088f42312b7e48c18a576b4d703fd7a/pyghostty-0.1.0-py3-none-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8a1c628bff9a449707ea71ae6fd47e859ce5d80a5312bef357c383b7e7a7e71c", size = 2010126, upload-time = "2026-07-24T07:20:29.153Z" },
-    { url = "https://files.pythonhosted.org/packages/50/c9/d56ce52b8e109c2dfa7882fe0b7b9ebd527c554b7d5e33f9e2648dfa89f3/pyghostty-0.1.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9461e0e42d9be8fd0a0afcd0e7c9487d5e900b1e57e64df16adc0ebdbb527194", size = 2176016, upload-time = "2026-07-24T07:20:31.06Z" },
+    { url = "https://files.pythonhosted.org/packages/83/23/6e12e3cb60c3c615c1ed9abbe580d95a6c64c504a371d2df1fc4e05edf0d/pyghostty-0.1.1-py3-none-macosx_13_0_arm64.whl", hash = "sha256:e4b44be45315012100b2d6f496db898af6f7165082ac79168a53ecc5415c2e84", size = 591185, upload-time = "2026-09-09T22:27:21.558Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/72/0aaf4ade4bdc6deb0f7b251f9237fef92ce8e24d01fd43164c65e4c41fe2/pyghostty-0.1.1-py3-none-macosx_13_0_x86_64.whl", hash = "sha256:a952b2a386ae815ed8cf83dc7c4237b4f4c92e7e84cf9c3cf8d892cbb88f9c5b", size = 655969, upload-time = "2026-09-09T22:27:23.42Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/92/82a8672242b12fab17052244d3a44919a0e682c75b877ce758cafec51551/pyghostty-0.1.1-py3-none-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e7145f43d4c24d7690495855aa93334ae291d7afeea6e36927d243e7788838bb", size = 2104581, upload-time = "2026-09-09T22:27:25.218Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/24/8e46ed45b4737ca4f7dbdb70ac910531d07fe9d8b08bc50e685d6b73e2c5/pyghostty-0.1.1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:30cf24518da22687929ec2910620347d4df2178260987771580f8db17d53cb27", size = 2275348, upload-time = "2026-09-09T22:27:27.445Z" },
 ]
 
 [[package]]

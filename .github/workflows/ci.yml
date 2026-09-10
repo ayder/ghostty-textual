@@ -41,6 +41,9 @@ jobs:
           PY
       - run: uv run --no-sync ruff check src tests benchmarks
       - run: uv run --no-sync pytest -q
+        env:
+          # Hosted runners measured up to 41 ms; retain 10 ms as the local default.
+          GHOSTTY_TEXTUAL_FRAME_BUDGET_MS: "50"
       - run: uv build
       - name: Install and exercise the wheel in a clean environment
         shell: bash

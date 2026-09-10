@@ -87,7 +87,7 @@ uv run ruff check src tests
 ```
 
 The full-frame extraction benchmark defaults to a 10 ms p95 budget for a
-120×40 terminal. GitHub CI uses 50 ms to accommodate hosted runner performance.
+120×40 terminal. GitHub CI uses 100 ms to accommodate hosted runner performance.
 Set `GHOSTTY_TEXTUAL_FRAME_BUDGET_MS` to override the budget locally.
 
 ## Licence

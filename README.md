@@ -116,6 +116,28 @@ uv run python benchmarks/feed_bursts.py
 See [performance measurements and cache design](docs/performance.md) for results
 and measurement scope.
 
+## Releasing
+
+Update the version in `pyproject.toml` and `uv.lock`, merge the release PR, then
+push a matching tag such as `v0.0.4`. The tag must point to the merged commit that
+contains that version and the release workflow.
+
+CI builds and smoke-tests distributions on all four supported platforms. The
+Linux x86_64 job retains its wheel and source archive as the `python-dist` Actions
+artifact on every run. After all platform jobs pass on a `v*` tag push, the release
+job verifies the tag, package version, filenames, and archive metadata, then
+attaches the tested files to a GitHub Release. It creates a draft when needed and
+publishes only after the uploads succeed; an existing release keeps its notes.
+
+The wheel is `ghostty_textual-<version>-py3-none-any.whl`: one wheel supports all
+the listed platforms, with the native binary supplied by the pinned `pyghostty`
+dependency. The source archive is `ghostty_textual-<version>.tar.gz`.
+
+Retry a failed release job from Actions. Already uploaded assets are downloaded
+and compared before being reused; differing files fail rather than replacing a
+published asset. No separate token is needed: only the tag release job receives
+`contents: write` permission. This workflow publishes to GitHub Releases, not PyPI.
+
 ## Licence
 
 MIT

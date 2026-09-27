@@ -184,15 +184,27 @@ class Native:
         behavior.value.b = 0
         fn(terminal, behavior[0])
 
-    def grid_ref(self, terminal: Any, x: int, y: int) -> Any:
-        """Return a viewport grid reference through pyghostty's point twin."""
-        fn = self._union_fn("ghostty_terminal_grid_ref", _GRID_REF_SIG)
+    def grid_ref_buffers(self) -> tuple[Any, Any]:
+        """Allocate reusable point-twin and grid-reference output buffers."""
         point = self.ffi.new("GhosttyPointS*")
+        out = self.ffi.new("GhosttyGridRef*")
+        out.size = self.ffi.sizeof("GhosttyGridRef")
+        return point, out
+
+    def grid_ref(self, terminal: Any, x: int, y: int, *, point: Any = None, out: Any = None) -> Any:
+        """Return a viewport reference, optionally reusing ``grid_ref_buffers()``.
+
+        The returned output is overwritten on the next call using the same buffers.
+        """
+        fn = self._union_fn("ghostty_terminal_grid_ref", _GRID_REF_SIG)
+        if point is None:
+            point = self.ffi.new("GhosttyPointS*")
         point.tag = self.lib.GHOSTTY_POINT_TAG_VIEWPORT
         point.value.x = x
         point.value.y = y
-        out = self.ffi.new("GhosttyGridRef*")
-        out.size = self.ffi.sizeof("GhosttyGridRef")
+        if out is None:
+            out = self.ffi.new("GhosttyGridRef*")
+            out.size = self.ffi.sizeof("GhosttyGridRef")
         self.check(fn(terminal, point[0], out), "terminal_grid_ref")
         return out
 

@@ -48,6 +48,12 @@ view = TerminalView(
 session.on_output = view.feed
 ```
 
+`feed()` parses bytes and queues replies immediately, then coalesces frame
+extraction until the next event-loop turn. Call `view.refresh_frame()` after
+feeding when you need to inspect the rendered frame synchronously. Synchronized
+output still withholds frames until release or timeout; `refresh_frame(force=True)`
+explicitly bypasses that hold.
+
 The application remains responsible for process and PTY lifecycle. For
 reconnects, close the old process, `await view.reset_io()`, call
 `view.hard_reset()`, then start the replacement process.
@@ -89,6 +95,18 @@ uv run ruff check src tests
 The full-frame extraction benchmark defaults to a 10 ms p95 budget for a
 120×40 terminal. GitHub CI uses 100 ms to accommodate hosted runner performance.
 Set `GHOSTTY_TEXTUAL_FRAME_BUDGET_MS` to override the budget locally.
+
+Additional benchmarks cover styled and linked extraction, row rendering,
+selection, and fragmented input through a mounted widget:
+
+```bash
+uv run python benchmarks/frame_extraction.py
+uv run python benchmarks/widget_rendering.py
+uv run python benchmarks/feed_bursts.py
+```
+
+See [performance measurements and cache design](docs/performance.md) for results
+and measurement scope.
 
 ## Licence
 

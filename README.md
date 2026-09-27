@@ -93,8 +93,16 @@ uv run ruff check src tests
 ```
 
 The full-frame extraction benchmark defaults to a 10 ms p95 budget for a
-120×40 terminal. GitHub CI uses 100 ms to accommodate hosted runner performance.
-Set `GHOSTTY_TEXTUAL_FRAME_BUDGET_MS` to override the budget locally.
+120×40 terminal. GitHub CI enforces 100 ms on Linux and macOS ARM64. Hosted macOS
+Intel records median/p95 and budget violations without failing on timing alone;
+that runner has exceeded 100 ms even on the pre-optimization baseline. Functional,
+memory, ABI, and packaging checks remain mandatory on every platform. Native
+extraction errors still fail the timing step, including on Intel.
+
+Set `GHOSTTY_TEXTUAL_FRAME_BUDGET_MS` to override the budget locally. The default
+`GHOSTTY_TEXTUAL_FRAME_BUDGET_MODE=enforce` asserts the p95 budget; `report` records
+timings without asserting the cutoff. CI runs the timing test separately with
+output capture disabled so successful runs also retain measurements in their logs.
 
 Additional benchmarks cover styled and linked extraction, row rendering,
 selection, and fragmented input through a mounted widget:

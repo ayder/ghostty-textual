@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+import statistics
 import time
 import tracemalloc
 
@@ -14,6 +15,8 @@ from ghostty_textual.emulator import Terminal
 def test_full_frame_extraction_within_budget() -> None:
     budget_ms = float(os.environ.get("GHOSTTY_TEXTUAL_FRAME_BUDGET_MS", "10"))
     assert 0 < budget_ms < float("inf"), "frame budget must be positive and finite"
+    budget_mode = os.environ.get("GHOSTTY_TEXTUAL_FRAME_BUDGET_MODE", "enforce")
+    assert budget_mode in {"enforce", "report"}, "frame budget mode must be enforce or report"
     gc.collect()
     gc.disable()
     try:
@@ -29,7 +32,14 @@ def test_full_frame_extraction_within_budget() -> None:
     finally:
         gc.enable()
     p95 = sorted(samples)[95]
-    assert p95 < budget_ms, f"p95 {p95:.2f} ms exceeds the {budget_ms:g} ms budget"
+    median = statistics.median(samples)
+    status = "within budget" if p95 < budget_ms else "OVER BUDGET"
+    print(
+        f"Full frame 120x40: median {median:.2f} ms, p95 {p95:.2f} ms; "
+        f"budget {budget_ms:g} ms ({budget_mode}): {status}"
+    )
+    if budget_mode == "enforce":
+        assert p95 < budget_ms, f"p95 {p95:.2f} ms exceeds the {budget_ms:g} ms budget"
 
 
 @pytest.mark.performance

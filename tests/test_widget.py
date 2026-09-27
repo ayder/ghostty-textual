@@ -164,6 +164,7 @@ async def test_spacer_head_paints_right_margin_background() -> None:
     app = Harness()
     async with app.run_test(size=(6, 2)):
         app.view.feed(b"\x1b[44mabcde" + "字".encode())
+        app.view.refresh_frame()
         strip = app.view.render_line(0)
         assert strip.cell_length == 6
         assert strip.text == "abcde "
@@ -175,6 +176,7 @@ async def test_wide_tail_cursor_overlays_wide_head() -> None:
     async with app.run_test(size=(6, 2)):
         app.view.feed("界".encode())
         app.view.feed(b"\x1b[1;2H")
+        app.view.refresh_frame()
         app.view._focused = True
         strip = app.view.render_line(0)
         assert strip._segments[0].style.reverse
@@ -184,6 +186,7 @@ async def test_selection_preserves_soft_wraps() -> None:
     app = Harness()
     async with app.run_test(size=(10, 3)):
         app.view.feed(b"ABCDEFGHIJKLMNOPQRST")
+        app.view.refresh_frame()
         app.view._selection_anchor = (0, 0)
         app.view._selection_end = (9, 1)
         assert app.view.get_selection() == "ABCDEFGHIJKLMNOPQRST"
@@ -193,6 +196,7 @@ async def test_selection_implements_textual_widget_contract() -> None:
     app = Harness()
     async with app.run_test(size=(10, 3)):
         app.view.feed(b"abc\r\ndef")
+        app.view.refresh_frame()
         selection = Selection(Offset(1, 0), Offset(2, 1))
         app.screen.selections[app.view] = selection
 
@@ -214,6 +218,7 @@ async def test_cursor_only_frame_invalidates_only_cursor_row() -> None:
     app = Harness()
     async with app.run_test(size=(20, 3)):
         app.view.feed(b"abcdef")
+        app.view.refresh_frame()
         calls: list[tuple[Region, ...]] = []
 
         def record_refresh(*regions: Region, **kwargs) -> None:
@@ -221,6 +226,7 @@ async def test_cursor_only_frame_invalidates_only_cursor_row() -> None:
 
         app.view.refresh = record_refresh
         app.view.feed(b"\x1b[3D")
+        app.view.refresh_frame()
         assert calls == [(Region(0, 0, 20, 1),)]
         assert app.view._cursor.x == 3
 
@@ -229,6 +235,7 @@ async def test_generation_mismatch_recovers_with_a_full_native_frame() -> None:
     app = Harness()
     async with app.run_test(size=(10, 2)):
         app.view.feed(b"real")
+        app.view.refresh_frame()
         shadow = app.view._shadow
         fake = Frame(
             generation=shadow.generation + 1,
@@ -264,6 +271,7 @@ async def test_drag_selection_preserves_hard_breaks() -> None:
     app = Harness()
     async with app.run_test(size=(10, 3)):
         app.view.feed(b"abc\r\ndef")
+        app.view.refresh_frame()
         app.view.on_mouse_down(SimpleNamespace(x=1, y=0))
         app.view.on_mouse_move(SimpleNamespace(x=2, y=1, button=1))
         app.view.on_mouse_up(SimpleNamespace(x=2, y=1))

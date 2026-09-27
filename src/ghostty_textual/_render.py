@@ -92,17 +92,18 @@ class RenderState:
         self._cell_values = ffi.new("void*[]", [self._wide, self._has_link])
         self._style = ffi.new("GhosttyStyle*")
         self._style.size = ffi.sizeof("GhosttyStyle")
+        self._style_bytes = ffi.buffer(self._style)
         self._fg = ffi.new("GhosttyColorRgb*")
         self._bg = ffi.new("GhosttyColorRgb*")
-        self._style_keys = ffi.new(
-            "GhosttyRenderStateRowCellsData[]",
-            [
-                lib.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
-                lib.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
-                lib.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
-            ],
-        )
-        self._style_values = ffi.new("void*[]", [self._style, self._fg, self._bg])
+        self._fg_bytes = ffi.buffer(self._fg)
+        self._bg_bytes = ffi.buffer(self._bg)
+        # Cache public accessor values, not native style IDs. Include
+        # resolved colors because background-only cells can override the style.
+        self._style_cache: dict[tuple[bytes, bytes, bytes], CellStyle] = {}
+        self._link_point, self._link_ref = native.grid_ref_buffers()
+        self._link_needed = ffi.new("size_t*")
+        self._link_capacity = 256
+        self._link_buffer = ffi.new("uint8_t[]", self._link_capacity)
         self._written = ffi.new("size_t*")
         self._default_style = CellStyle()
         self.closed = False
@@ -110,6 +111,9 @@ class RenderState:
     def update(self, terminal: Any) -> None:
         self._assert_open()
         self._terminal = terminal
+        # Palette/default colors and style identities can change on any update.
+        # The cache is also bounded within one extraction of a large viewport.
+        self._style_cache.clear()
         self.native.check(
             self.native.lib.ghostty_render_state_update(self._state, terminal),
             "render_state_update",
@@ -276,7 +280,6 @@ class RenderState:
 
     def _read_style(self) -> CellStyle:
         lib = self.native.lib
-        self._style.size = self.native.ffi.sizeof("GhosttyStyle")
         self.native.check(
             lib.ghostty_render_state_row_cells_get(
                 self._cells,
@@ -299,13 +302,17 @@ class RenderState:
             self._fg[0] = self._colors.foreground
         if bg_rc:
             self._bg[0] = self._colors.background
+        key = (bytes(self._style_bytes), bytes(self._fg_bytes), bytes(self._bg_bytes))
+        cached = self._style_cache.get(key)
+        if cached is not None:
+            return cached
         style = self._style
         underline_color = None
         if style.underline_color.tag == lib.GHOSTTY_STYLE_COLOR_RGB:
             underline_color = _rgb(style.underline_color.value.rgb)
         elif style.underline_color.tag == lib.GHOSTTY_STYLE_COLOR_PALETTE:
             underline_color = _rgb(self._colors.palette[int(style.underline_color.value.palette)])
-        return CellStyle(
+        result = CellStyle(
             fg=_rgb(self._fg),
             bg=_rgb(self._bg),
             underline_color=underline_color,
@@ -319,20 +326,36 @@ class RenderState:
             overline=bool(style.overline),
             underline=int(style.underline),
         )
+        if len(self._style_cache) >= 4096:
+            self._style_cache.clear()
+        self._style_cache[key] = result
+        return result
 
     def _read_link(self, x: int, y: int, links: LinkInterner) -> int | None:
         ffi, lib = self.native.ffi, self.native.lib
-        ref = self.native.grid_ref(self._terminal, x, y)
-        needed = ffi.new("size_t*")
-        rc = lib.ghostty_grid_ref_hyperlink_uri(ref, ffi.NULL, 0, needed)
-        if rc not in (0, -3) or needed[0] == 0:
+        if links.max_uri_bytes <= 0:
             return None
-        buf = ffi.new("uint8_t[]", int(needed[0]))
-        self.native.check(
-            lib.ghostty_grid_ref_hyperlink_uri(ref, buf, int(needed[0]), needed),
-            "grid_ref_hyperlink_uri",
+        ref = self.native.grid_ref(self._terminal, x, y, point=self._link_point, out=self._link_ref)
+        needed = self._link_needed
+        needed[0] = 0
+        capacity = min(self._link_capacity, links.max_uri_bytes)
+        rc = lib.ghostty_grid_ref_hyperlink_uri(ref, self._link_buffer, capacity, needed)
+        if rc not in (0, -3) or needed[0] == 0 or needed[0] > links.max_uri_bytes:
+            return None
+        if rc == -3:
+            self._link_capacity = min(
+                max(int(needed[0]), self._link_capacity * 2), links.max_uri_bytes
+            )
+            self._link_buffer = ffi.new("uint8_t[]", self._link_capacity)
+            self.native.check(
+                lib.ghostty_grid_ref_hyperlink_uri(
+                    ref, self._link_buffer, self._link_capacity, needed
+                ),
+                "grid_ref_hyperlink_uri",
+            )
+        return links.intern(
+            bytes(ffi.buffer(self._link_buffer, int(needed[0]))).decode("utf-8", "replace")
         )
-        return links.intern(bytes(ffi.buffer(buf, int(needed[0]))).decode("utf-8", "replace"))
 
     def read_cursor(self) -> CursorState:
         lib = self.native.lib

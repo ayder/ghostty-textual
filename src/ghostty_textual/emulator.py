@@ -362,16 +362,17 @@ class Terminal:
         """Copy changed rows; recover a dropped frame with ``force=True``."""
         self._assert_usable()
         assert self._render is not None
-        self._render.update(self._terminal)
-        cursor = self._render.read_cursor()
-        color_signature = self._render.color_signature()
+        sync_output = self._mode(2026)
         if (
             not force
-            and self.modes.sync_output
+            and sync_output
             and self._sync_started is not None
             and time.monotonic() - self._sync_started < 0.150
         ):
             return None
+        self._render.update(self._terminal)
+        cursor = self._render.read_cursor()
+        color_signature = self._render.color_signature()
         force = force or self._force_redraw
         if self._last_color_signature is not None and color_signature != self._last_color_signature:
             force = True
@@ -405,7 +406,7 @@ class Terminal:
             links=self._links.table(),
             cursor=cursor,
             viewport=self._read_viewport(),
-            frame_pending=self.modes.sync_output,
+            frame_pending=sync_output,
         )
         self._render.clear_global_dirty()
         self._force_redraw = False
@@ -490,6 +491,12 @@ class Terminal:
             return None
         packed = int(value[0])
         return (packed & 255, (packed >> 8) & 255, (packed >> 16) & 255)
+
+    @property
+    def sync_output(self) -> bool:
+        """Whether synchronized output is enabled, without querying unrelated modes."""
+        self._assert_usable()
+        return self._mode(2026)
 
     @property
     def modes(self) -> TerminalModes:

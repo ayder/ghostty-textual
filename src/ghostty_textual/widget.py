@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from typing import Any
 
 from rich.segment import Segment
@@ -144,6 +145,7 @@ class TerminalView(Widget):
         self._sync_timeout_timer: Any = None
         self._blink_timer: Any = None
         self._cursor_phase = True
+        self._frame_handle: asyncio.Handle | None = None
 
     @property
     def cursor_visible(self) -> bool:
@@ -194,6 +196,11 @@ class TerminalView(Widget):
         self.sync_terminal_size()
 
     def feed(self, data: bytes) -> None:
+        """Parse bytes now and coalesce frame extraction until the next loop turn.
+
+        Call ``refresh_frame()`` afterwards when a synchronous frame is required.
+        Replies and notifications are dispatched without waiting for rendering.
+        """
         if self.failed or not self._mounted_ready:
             return
         try:
@@ -207,8 +214,9 @@ class TerminalView(Widget):
                     self.post_message(Bell())
                 elif isinstance(notification, ClipboardWritten):
                     self.post_message(ClipboardWrite(notification.text))
-            self.refresh_frame()
-            if self.terminal.modes.sync_output:
+            if self._frame_handle is None:
+                self._frame_handle = asyncio.get_running_loop().call_soon(self._flush_frame)
+            if self.terminal.sync_output:
                 if self._sync_timeout_timer is None:
                     self._sync_timeout_timer = self.set_timer(0.16, self._flush_sync_timeout)
             elif self._sync_timeout_timer is not None:
@@ -222,7 +230,18 @@ class TerminalView(Widget):
         self._sync_timeout_timer = None
         self.refresh_frame()
 
+    def _cancel_pending_frame(self) -> None:
+        if self._frame_handle is not None:
+            self._frame_handle.cancel()
+            self._frame_handle = None
+
+    def _flush_frame(self) -> None:
+        self._frame_handle = None
+        if self._mounted_ready:
+            self.refresh_frame()
+
     def refresh_frame(self, *, force: bool = False) -> None:
+        self._cancel_pending_frame()
         if self.failed:
             return
         try:
@@ -289,15 +308,24 @@ class TerminalView(Widget):
         segments: list[Segment] = []
         run_text: list[str] = []
         run_key: tuple[int, str | None] | None = None
+        selection_start, selection_end = self._selection_span(y, len(cells))
+        cursor = self._cursor
+        cursor_x = -1
+        cursor_overlay = "reverse"
+        if (
+            self._focused
+            and cursor is not None
+            and cursor.visible
+            and cursor.y == y
+            and (not cursor.blinking or self._cursor_phase)
+        ):
+            cursor_x = cursor.x - int(cursor.wide_tail)
+            cursor_overlay = "underline" if cursor.style == 2 else "reverse"
 
         def flush() -> None:
             if not run_text or run_key is None:
                 return
-            style = self._rich_style(self._shadow.styles[run_key[0]])
-            if run_key[1] == "underline":
-                style += Style(underline=True)
-            elif run_key[1] == "reverse":
-                style += Style(reverse=True)
+            style = self._rich_style(self._shadow.styles[run_key[0]], run_key[1])
             segments.append(Segment("".join(run_text), style))
             run_text.clear()
 
@@ -305,7 +333,13 @@ class TerminalView(Widget):
             if cell.width == 0:
                 continue
             text = cell.text or " "
-            overlay = self._cell_overlay(x, y)
+            overlay = (
+                cursor_overlay
+                if x == cursor_x
+                else "reverse"
+                if selection_start <= x <= selection_end
+                else None
+            )
             key = (cell.style_id, overlay)
             if key != run_key:
                 flush()
@@ -315,27 +349,16 @@ class TerminalView(Widget):
         strip = Strip(segments, cell_length=self.terminal.cols)
         return strip.apply_offsets(0, y)
 
-    def _cell_overlay(self, x: int, y: int) -> str | None:
-        if (
-            self._focused
-            and self._cursor is not None
-            and self._cursor.visible
-            and (not self._cursor.blinking or self._cursor_phase)
-            and (
-                self._cursor.x - (1 if self._cursor.wide_tail else 0),
-                self._cursor.y,
-            )
-            == (x, y)
-        ):
-            return "underline" if self._cursor.style == 2 else "reverse"
+    def _selection_span(self, y: int, width: int) -> tuple[int, int]:
+        """Return inclusive column bounds, or an empty interval for this row."""
         if self._selection_anchor is not None and self._selection_end is not None:
             start, end = sorted(
                 (self._selection_anchor, self._selection_end),
                 key=lambda point: (point[1], point[0]),
             )
-            if (start[1], start[0]) <= (y, x) <= (end[1], end[0]):
-                return "reverse"
-        return None
+            if start[1] <= y <= end[1]:
+                return start[0] if y == start[1] else 0, end[0] if y == end[1] else width - 1
+        return 0, -1
 
     def _blink_cursor(self) -> None:
         if not self.failed and self._focused and self._cursor is not None and self._cursor.blinking:
@@ -343,11 +366,12 @@ class TerminalView(Widget):
             self._refresh_rows({self._cursor.y})
 
     @staticmethod
-    def _rich_style(style: CellStyle) -> Style:
+    @lru_cache(maxsize=4096)
+    def _rich_style(style: CellStyle, overlay: str | None = None) -> Style:
         def color(value: tuple[int, int, int] | None) -> str | None:
             return None if value is None else f"rgb({value[0]},{value[1]},{value[2]})"
 
-        return Style(
+        result = Style(
             color=color(style.fg),
             bgcolor=color(style.bg),
             bold=style.bold,
@@ -360,6 +384,11 @@ class TerminalView(Widget):
             overline=style.overline,
             underline=bool(style.underline),
         )
+        if overlay == "underline":
+            result += Style(underline=True)
+        elif overlay == "reverse":
+            result += Style(reverse=True)
+        return result
 
     async def on_key(self, event: events.Key) -> None:
         if self.failed or event.key in self._reserved_keys:
@@ -534,6 +563,10 @@ class TerminalView(Widget):
         return None
 
     def hard_reset(self) -> None:
+        self._cancel_pending_frame()
+        if self._sync_timeout_timer is not None:
+            self._sync_timeout_timer.stop()
+            self._sync_timeout_timer = None
         try:
             self.terminal.hard_reset()
             self._shadow = _Shadow(-1, (), (), (), ())
@@ -543,6 +576,7 @@ class TerminalView(Widget):
             self._fail(exc)
 
     async def reset_io(self) -> None:
+        self._cancel_pending_frame()
         if self._sync_timeout_timer is not None:
             self._sync_timeout_timer.stop()
             self._sync_timeout_timer = None
@@ -609,9 +643,7 @@ class TerminalView(Widget):
         put_task = asyncio.create_task(queue.put(data))
         shutdown_task = asyncio.create_task(shutdown.wait())
         try:
-            await asyncio.wait(
-                (put_task, shutdown_task), return_when=asyncio.FIRST_COMPLETED
-            )
+            await asyncio.wait((put_task, shutdown_task), return_when=asyncio.FIRST_COMPLETED)
         finally:
             put_task.cancel()
             shutdown_task.cancel()
@@ -628,6 +660,7 @@ class TerminalView(Widget):
         if self.failed:
             return
         self.failed = True
+        self._cancel_pending_frame()
         self._failure = error
         if self._sync_timeout_timer is not None:
             self._sync_timeout_timer.stop()

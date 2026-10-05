@@ -88,13 +88,17 @@ def test_modes_and_encoders() -> None:
 def test_requested_dimensions_and_scrollback_limit(scrollback: int) -> None:
     with Terminal(17, 4, scrollback=scrollback) as terminal:
         assert (terminal.cols, terminal.rows) == (17, 4)
-        terminal.feed(b"line\r\n" * 5000)
+        terminal.feed(b"line\r\n" * 10000)
         retained = terminal.viewport.scrollback_rows
         if scrollback == 0:
             assert retained == 0
         else:
             # Native retention is page-granular, not exactly the requested rows.
-            assert 0 < retained < 5000
+            # Cross historical page boundaries and use a large enough limit
+            # to distinguish retention on both real dependency versions.
+            with Terminal(17, 4, scrollback=10_000_000) as larger:
+                larger.feed(b"line\r\n" * 10000)
+                assert 0 < retained < larger.viewport.scrollback_rows
         terminal.hard_reset()
         assert terminal.viewport.scrollback_rows == 0
 

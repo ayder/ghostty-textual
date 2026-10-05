@@ -9,7 +9,8 @@ Ruling: accept 64 suffix codepoints and retain a 257-byte buffer-growth witness;
 continue through spec and plan reviews into implementation.
 Spec review: `.ayder/reviews/pyghostty-0.1.3-spec-r1.md`, APPROVED.
 Plan: `.ayder/plans/pyghostty-0.1.3/plan.md`, revision 1.
-Plan bundle SHA256: 3c4d9434d2ef74406d7fd2ff151a1b9217ef61cba9ba35b813d0f60578a3e048.
+Current plan bundle SHA256: 541ad4c1dc87dc5adf98f45ed7d00a99d536ac6b0bae3cc1143983e941e29cb2.
+Prior implementation snapshot: 3c4d9434d2ef74406d7fd2ff151a1b9217ef61cba9ba35b813d0f60578a3e048.
 Plan review: `.ayder/reviews/pyghostty-0.1.3-plan-r2.md`, APPROVED; supersedes r1.
 Status: approved spec and plan handoff closed; user authorized continuation.
 Implementation branch: fix/pyghostty-0.1.3; coordinator implements K1–K3 serially.
@@ -31,3 +32,20 @@ Pre-candidate functional run: 139 passed, timing test intentionally separate.
 Status: K1–K3 complete; final docs commit is the candidate; fresh gate and
 branch review pending. No further source changes permitted during gate.
 Hosted four-platform CI is NOT RUN on this unpublished branch.
+
+## Branch review correction handoff
+
+Candidate 105b34c received NEEDS REVISION in branch-r1.md: BR1, Medium,
+positive scrollback witness admitted an omitted-setter counterexample.
+Production setter was correct. Revise W2 to compare small and sufficiently
+large limits after enough lines to cross historical page granularity.
+Revised bundle 541ad4c1dc87dc5adf98f45ed7d00a99d536ac6b0bae3cc1143983e941e29cb2
+approved in `.ayder/reviews/pyghostty-0.1.3-plan-r3.md`. Preserve original candidate and gate reports;
+new candidate needs corrected before/after preservation, fresh full gate and
+branch-r2 review. Source behavior and spec/operator rulings unchanged.
+
+Plan-r3 handoff closed; approved digest revalidated. Corrected W2 ran against
+baseline source/real 0.1.1 (2 passed) and candidate/locked 0.1.3 (2 passed).
+Raw outputs: br1-preservation-before-corrected.txt and
+br1-preservation-after-corrected.txt. BR1 changes proof only; next commit is
+the new candidate, followed by fresh full gate and branch-r2 re-review.

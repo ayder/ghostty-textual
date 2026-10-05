@@ -119,8 +119,10 @@ class RenderState:
             "render_state_update",
         )
         self.native.check(
-            self.native.lib.ghostty_render_state_colors_get(self._state, self._colors),
-            "render_state_colors_get",
+            self.native.lib.ghostty_render_state_get(
+                self._state, self.native.lib.GHOSTTY_RENDER_STATE_DATA_COLORS, self._colors
+            ),
+            "render_state_get COLORS",
         )
         self._default_style = CellStyle(
             fg=_rgb(self._colors.foreground), bg=_rgb(self._colors.background)

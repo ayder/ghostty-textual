@@ -184,13 +184,24 @@ class Terminal:
     def _create_native(self) -> None:
         ffi, lib = self._native.ffi, self._native.lib
         handle = ffi.new("GhosttyTerminal*")
-        options = ffi.new(
-            "GhosttyTerminalOptions*",
-            dict(cols=self._cols, rows=self._rows, max_scrollback=self._scrollback),
+        self._native.check(
+            lib.ghostty_terminal_new(ffi.NULL, handle, self._cols, self._rows), "terminal_new"
         )
-        self._native.check(lib.ghostty_terminal_new(ffi.NULL, handle, options[0]), "terminal_new")
         self._terminal = handle[0]
         try:
+            # A zero line limit still retains the active native page. A zero
+            # byte limit explicitly disables history, matching our public API.
+            scrollback_option = (
+                lib.GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES
+                if self._scrollback == 0
+                else lib.GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES
+            )
+            self._native.check(
+                lib.ghostty_terminal_set(
+                    self._terminal, scrollback_option, ffi.new("size_t*", self._scrollback)
+                ),
+                "terminal_set SCROLLBACK",
+            )
             self._register_callbacks()
             self._apply_limits()
             self._apply_theme()
@@ -527,9 +538,11 @@ class Terminal:
         return int(lib.GHOSTTY_MOUSE_FORMAT_X10)
 
     def _mode(self, mode: int) -> bool:
-        out = self._native.ffi.new("bool*")
-        rc = self._native.lib.ghostty_terminal_mode_get(self._terminal, mode, out)
-        return not rc and bool(out[0])
+        out = self._native.ffi.new("GhosttyTerminalModeConfig*", {"mode": mode})
+        rc = self._native.lib.ghostty_terminal_get(
+            self._terminal, self._native.lib.GHOSTTY_TERMINAL_DATA_MODE, out
+        )
+        return not rc and bool(out.value)
 
     def encode_key(self, event: KeyEvent) -> bytes | None:
         self._assert_usable()

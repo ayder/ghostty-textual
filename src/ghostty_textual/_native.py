@@ -60,7 +60,6 @@ REQUIRED_SYMBOLS = (
     "ghostty_render_state_end_update",
     "ghostty_render_state_get",
     "ghostty_render_state_set",
-    "ghostty_render_state_colors_get",
     "ghostty_render_state_row_iterator_new",
     "ghostty_render_state_row_iterator_next",
     "ghostty_render_state_row_iterator_free",
@@ -75,7 +74,6 @@ REQUIRED_SYMBOLS = (
     "ghostty_cell_get",
     "ghostty_cell_get_multi",
     "ghostty_row_get",
-    "ghostty_terminal_mode_get",
     # encoders
     "ghostty_key_encoder_new",
     "ghostty_key_encoder_free",

@@ -69,7 +69,7 @@ reconnects, close the old process, `await view.reset_io()`, call
 
 ## Supported platforms
 
-Requires Python 3.12+ and pins `pyghostty==0.1.1`, which bundles libghostty-vt
+Requires Python 3.12+ and pins `pyghostty==0.1.3`, which bundles libghostty-vt
 built for baseline CPUs. No native compilation is needed to install it.
 
 | OS | Architectures | Minimum OS / libc |
@@ -83,6 +83,12 @@ does not publish Windows, musl/Alpine Linux, or 32-bit ARM wheels.
 
 CI runs the native ABI and functional tests, plus a clean wheel installation
 and terminal smoke test, on Linux and macOS with both CPU architectures.
+
+The bundled native library retains a cell's base codepoint plus at most 64
+additional grapheme codepoints. Further combining codepoints are ignored to
+bound memory and processing costs. This applies across fragmented input too.
+The scheduled ABI drift job tests the latest upstream binding separately from
+the exact dependency used by normal CI and released distributions.
 
 ## Develop
 

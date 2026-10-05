@@ -88,10 +88,20 @@ def make_terminal(
 ) -> Harness:
     ffi, lib = native.ffi, native.lib
     handle = ffi.new("GhosttyTerminal*")
-    options = ffi.new(
-        "GhosttyTerminalOptions*", dict(cols=cols, rows=rows, max_scrollback=scrollback)
+    native.check(lib.ghostty_terminal_new(ffi.NULL, handle, cols, rows), "terminal_new")
+    option = (
+        lib.GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES
+        if scrollback == 0
+        else lib.GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES
     )
-    native.check(lib.ghostty_terminal_new(ffi.NULL, handle, options[0]), "terminal_new")
+    try:
+        native.check(
+            lib.ghostty_terminal_set(handle[0], option, ffi.new("size_t*", scrollback)),
+            "terminal_set SCROLLBACK",
+        )
+    except BaseException:
+        lib.ghostty_terminal_free(handle[0])
+        raise
 
     harness = Harness(native=native, terminal=handle[0])
 

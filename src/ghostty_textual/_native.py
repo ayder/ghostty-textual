@@ -60,7 +60,6 @@ REQUIRED_SYMBOLS = (
     "ghostty_render_state_end_update",
     "ghostty_render_state_get",
     "ghostty_render_state_set",
-    "ghostty_render_state_colors_get",
     "ghostty_render_state_row_iterator_new",
     "ghostty_render_state_row_iterator_next",
     "ghostty_render_state_row_iterator_free",
@@ -75,7 +74,6 @@ REQUIRED_SYMBOLS = (
     "ghostty_cell_get",
     "ghostty_cell_get_multi",
     "ghostty_row_get",
-    "ghostty_terminal_mode_get",
     # encoders
     "ghostty_key_encoder_new",
     "ghostty_key_encoder_free",
@@ -106,7 +104,7 @@ REQUIRED_SYMBOLS = (
 
 # ABI-mode cffi cannot pass unions by value. pyghostty ships a layout-identical
 # struct twin for GhosttyPoint and notes that GhosttyTerminalScrollViewport
-# needs the same treatment "later"; as of pyghostty 0.1.1 that twin does not
+# needs the same treatment "later"; as of pyghostty 0.1.3 that twin does not
 # exist, so we carry it.
 #
 # The union is {intptr_t delta | size_t row | uint64_t _padding[2]} = 16 bytes,

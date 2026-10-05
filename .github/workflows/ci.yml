@@ -68,7 +68,7 @@ jobs:
 
           from ghostty_textual import Terminal, TerminalView
 
-          assert version("pyghostty") == "0.1.1"
+          assert version("pyghostty") == "0.1.3"
           assert "pyghostty._ffi" not in sys.modules
           with Terminal(20, 3, scrollback=100) as terminal:
               terminal.feed(b"hello")
@@ -169,4 +169,6 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --all-extras
       - run: uv pip install --upgrade pyghostty
+      - name: Report tested upstream binding
+        run: uv run --no-sync python -c "from importlib.metadata import version; print('pyghostty==' + version('pyghostty'))"
       - run: uv run --no-sync pytest tests/test_abi.py -v

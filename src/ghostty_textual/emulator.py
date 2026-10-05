@@ -269,10 +269,9 @@ class Terminal:
     def _register_clipboard_callback(self) -> None:
         ffi, lib = self._native.ffi, self._native.lib
 
-        @ffi.callback(
-            "GhosttyClipboardWriteResult(GhosttyTerminal, void*, const GhosttyClipboardWrite*)"
-        )
+        @ffi.callback("void(GhosttyTerminal, void*, const GhosttyClipboardWrite*)")
         def clipboard_write(term, userdata, write):  # noqa: ANN001, ARG001
+            result = lib.GHOSTTY_CLIPBOARD_WRITE_RESULT_DENIED
             try:
                 for index in range(int(write.contents_len)):
                     item = write.contents[index]
@@ -282,11 +281,21 @@ class Terminal:
                     data = bytes(ffi.buffer(item.data.ptr, item.data.len))
                     if mime.startswith("text/") and len(data) <= self._clipboard.max_bytes:
                         self._notify(ClipboardWritten(data.decode("utf-8", "replace")))
-                        return lib.GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS
-                return lib.GHOSTTY_CLIPBOARD_WRITE_RESULT_DENIED
+                        result = lib.GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS
+                        break
             except BaseException as exc:
                 self._callback_error = exc
-                return lib.GHOSTTY_CLIPBOARD_WRITE_RESULT_IO_ERROR
+                result = lib.GHOSTTY_CLIPBOARD_WRITE_RESULT_IO_ERROR
+            reply = ffi.new(
+                "GhosttyClipboardWriteReply*",
+                {
+                    "size": ffi.sizeof("GhosttyClipboardWriteReply"),
+                    "result": result,
+                    "remember": False,
+                },
+            )
+            # Both the request and reply are borrowed only during this callback.
+            write.reply(write, reply)
 
         self._keepalive.append(clipboard_write)
         self._native.check(

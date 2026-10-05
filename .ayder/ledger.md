@@ -49,3 +49,22 @@ baseline source/real 0.1.1 (2 passed) and candidate/locked 0.1.3 (2 passed).
 Raw outputs: br1-preservation-before-corrected.txt and
 br1-preservation-after-corrected.txt. BR1 changes proof only; next commit is
 the new candidate, followed by fresh full gate and branch-r2 re-review.
+
+## Version 0.0.5 amendment handoff
+
+The migration candidate 7d725d6 received APPROVED branch-r2 and fresh PR review;
+BR1 is closed. PR #4 was published after operator confirmation. Its hosted
+four-platform CI passed; scheduled execution is skipped on PR events, while
+the same-SHA local upgrade probe passed 11 ABI tests. Historical handoffs above
+retain their original state and are superseded by this entry.
+
+Operator now requests that the 0.0.5 package bump go into PR #4. This expands
+the earlier implementation scope that held the package at 0.0.4. Treat the
+metadata amendment as T1; native behavior and its approved T2 contracts stay
+unchanged. Authority: .ayder/plans/version-0.0.5/note.md and linked checks.
+Execution snapshot digest: cefef9d37296c7ad64f0c2a01cd0a37bf43bd412cd593b9ae6f02ea356b5a08a.
+Baseline: 7d725d6423eb47213d0291ffe424ec5136e89e10; verified to match PR #4.
+Coordinator changes only project/lock versions to 0.0.5, records this handoff,
+then commits a new candidate for fresh independent full gate and branch review.
+Evidence root: .ayder/evidence/version-0.0.5/. Publication authorization persists
+for updating PR #4; no merge, tag or release is authorized.

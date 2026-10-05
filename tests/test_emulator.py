@@ -75,6 +75,28 @@ def test_modes_and_encoders() -> None:
         assert terminal.encode_key(KeyEvent("up")) == b"\x1bOA"
         assert terminal.encode_paste("a\nb") == b"\x1b[200~a\nb\x1b[201~"
         assert terminal.encode_focus(True) == b"\x1b[I"
+        terminal.feed(b"\x1b[?1l\x1b[?2004l\x1b[?1004l")
+        assert not terminal.modes.app_cursor_keys
+        assert not terminal.modes.bracketed_paste
+        assert not terminal.modes.focus_events
+        assert terminal.encode_key(KeyEvent("up")) == b"\x1b[A"
+        assert terminal.encode_paste("safe") == b"safe"
+        assert terminal.encode_focus(True) is None
+
+
+@pytest.mark.parametrize("scrollback", [0, 20])
+def test_requested_dimensions_and_scrollback_limit(scrollback: int) -> None:
+    with Terminal(17, 4, scrollback=scrollback) as terminal:
+        assert (terminal.cols, terminal.rows) == (17, 4)
+        terminal.feed(b"line\r\n" * 5000)
+        retained = terminal.viewport.scrollback_rows
+        if scrollback == 0:
+            assert retained == 0
+        else:
+            # Native retention is page-granular, not exactly the requested rows.
+            assert 0 < retained < 5000
+        terminal.hard_reset()
+        assert terminal.viewport.scrollback_rows == 0
 
 
 def test_unsafe_unbracketed_paste_is_rejected() -> None:

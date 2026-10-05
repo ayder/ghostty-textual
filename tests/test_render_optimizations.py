@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from ghostty_textual.cells import CellStyle
 from ghostty_textual.emulator import ResourceLimits, ScrollDelta, Terminal
 from ghostty_textual.theme import DEFAULT_THEME
@@ -134,7 +136,9 @@ def test_link_scratch_buffer_grows_reuses_and_rejects_oversized_uris() -> None:
 
 def test_long_grapheme_buffer_growth_preserves_styled_cells() -> None:
     with Terminal(10, 2) as terminal:
-        text = "e" + "\u0301" * 180
+        # 64 suffix codepoints respect the native cap; four-byte combining
+        # characters still require 257 bytes and grow the 256-byte buffer.
+        text = "e" + "\U0001d185" * 64
         terminal.feed(b"\x1b[31m" + text.encode() + b"x")
         frame = terminal.snapshot()
         cells = frame.row_patches[0].cells
@@ -142,3 +146,18 @@ def test_long_grapheme_buffer_growth_preserves_styled_cells() -> None:
         assert cells[1].text == "x"
         assert cells[0].style_id == cells[1].style_id
         assert terminal._render._utf8.cap >= len(text.encode())
+
+
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_grapheme_suffix_limit_preserves_following_cell(fragmented: bool) -> None:
+    with Terminal(10, 2) as terminal:
+        data = b"\x1b[31me" + ("\u0301" * 180).encode() + b"x"
+        if fragmented:
+            for byte in data:
+                terminal.feed(bytes([byte]))
+        else:
+            terminal.feed(data)
+        cells = terminal.snapshot().row_patches[0].cells
+        assert cells[0].text == "e" + "\u0301" * 64
+        assert cells[1].text == "x"
+        assert cells[0].style_id == cells[1].style_id

@@ -1,4 +1,7 @@
-# Development policy
+# Historical development policy
+
+Archived context for the records in this directory. Current development commands
+and CI checks are documented in `README.md` and `.github/workflows/ci.yml`.
 
 ## Testing and gate
 
@@ -47,17 +50,3 @@ under `docs/superpowers/`; new contracts, reviews and handoffs go in `.ayder/`.
 Search affected symbols and dependency-version references with `rg`, including
 README, source, tests, workflow, pyproject and lockfile. Do not rewrite historical
 documents as if they describe the new implementation.
-
-## Routing and ownership
-
-The coordinator authors contracts and owns operator rulings. Implementation is
-serial. Use a fresh Codex sub-agent with inherited model settings for independent
-spec, plan and branch reviews; it may write its review artifact but not its
-subject. Use a separate fresh gate runner for candidate verification. Record
-artifact paths, baseline/candidate SHA and evidence paths in each handoff.
-No parallel writers or shared test-estate runs are authorized.
-
-There are currently no built-binary seeded-harness tests. Any introduced tests of
-that kind are operator-written layers and must be developed with the operator.
-Do not merge, tag or release from an agent. Opening a PR requires literal
-`PR confirmed` under dev-contract-v2.

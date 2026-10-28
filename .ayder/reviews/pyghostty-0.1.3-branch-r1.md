@@ -7,7 +7,7 @@ Findings:
 
 Checked:
 
-- Read root AGENTS.md, `.ayder/policy.md`, dev-contract-v2 and its review reference, approved spec, all three linked witness files, plan reviews r1/r2, spec review, ledger, branch brief, implementation result, draft PR and full base-to-candidate product diff. T2 is appropriate; explicit operator authorization covers the 64-suffix characterization and continued implementation. Plan-r2 supersedes the zero-line choice in r1.
+- Read root AGENTS.md, `.ayder/policy.md`, approved spec, all three linked witness files, plan reviews r1/r2, spec review, ledger, branch brief, implementation result, draft PR and full base-to-candidate product diff. T2 is appropriate; explicit operator authorization covers the 64-suffix characterization and continued implementation. Plan-r2 supersedes the zero-line choice in r1.
 - Verified current HEAD equals the supplied candidate and the tracked working tree was clean before review. No source, subject, policy or witness edits were made; no test suite was run. One short isolated native constructor probe ran serially to check BR1. The probe allocated/freed independent handles through the actual candidate FFI, constructed 17x4 terminals, optionally set `SCROLLBACK_MAX_LINES` to 20, fed `b'line\r\n' * 5000`, and queried `SCROLLBACK_ROWS`. Output:
 
   ```text

@@ -4,7 +4,7 @@ Verdict: APPROVED
 Findings: None.
 
 Checked:
-- Read AGENTS.md, `.ayder/policy.md`, the spec, ledger, and dev-contract-v2 spec/review/repository-setup references. The change meets the repository's T2 triggers; the required independent reviews, serial implementation, native coverage and four-platform gate are coherent. The explicit operator ruling permits continuing and authorizes the sole characterization change.
+- Read AGENTS.md, `.ayder/policy.md`, the spec, ledger. The change meets the repository's T2 triggers; the required independent reviews, serial implementation, native coverage and four-platform gate are coherent. The explicit operator ruling permits continuing and authorizes the sole characterization change.
 - Verified HEAD is the stated baseline; only the new policy/contract tree is untracked. No subject or product files were edited during review, and no shared test runs were launched.
 - Opened the retained declaration diff, upstream pyproject and exploratory functional output. The bundled revision is `6467b1dab0be087fa8f0a7ccc7b3c5b88b9be7a5`. The exploratory result is 124 passed / 1 failed, with the existing 180-accent expectation the failure; it is correctly excluded from gate proof.
 - Inspected the actual versioned declarations and headers in `/tmp/ghostty-api-investigation/`: construction accepts dimensions, scrollback uses a `size_t*` setter, colors use the generic render getter, and mode uses an initialized input/output configuration. The adapted exploratory sources use those call paths. Native functional output supports feasibility without proving the final implementation.
